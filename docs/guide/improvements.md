@@ -1,0 +1,79 @@
+# Improvements on the original
+
+OpenAoK plays as the 1999 game does. These are the things it adds, each kept
+out of the way of the original's own look and rules.
+
+## The view
+
+- **Zoom.** The mouse wheel zooms the view in and out about the pointer, in
+  the game and in the scenario editor, as do `=` and `-`. The original's wheel
+  hotkeys (the Town Center, the next idle villager) are on Ctrl and the wheel.
+  On a touch screen two fingers pinch to zoom; on the Switch, ZL with the right
+  stick.
+- **Fog of war on the minimap.** The minimap shows what this player knows:
+  ground never explored is black, and ground explored but out of sight is
+  dimmed, as the map itself is.
+- **Widescreen.** The game's frame can be as wide as the screen, with the
+  interface reaching its edges (Options, Widescreen). It is on by default on
+  phones and the Switch.
+- **Interface sizes.** The top bar, the bottom panel with the minimap, and the
+  text over the world (chat, the game's messages, scores and timers) can each
+  be drawn from 100% to 200% of their size (Options, Top Bar Size, Panel Size,
+  Text Size).
+- **Production queue.** What the player's buildings are researching and
+  training shows in a row of icons at the map's top left. What leads each
+  queue, the item being made and those of its kind straight behind it, is
+  greened from the left as far as the one being made has got; what waits
+  behind something else in its queue, or in a queue held up for want of
+  houses, is yellowed. Each kind shows how many.
+  Clicking one selects the building making it and brings the view there;
+  clicking again goes on to the next such building (Options, Production Queue,
+  on by default). The game's messages move down below it.
+
+## Playing
+
+- **No selection limit.** Any number of units can be selected at once, by a
+  box, a click with Ctrl or Shift, or a double click. The original's limit of
+  forty is still there to turn on: Options, Disable selection limit, which is
+  checked by default.
+- **Training from several buildings.** With several buildings of a kind
+  selected, each unit or technology ordered goes to the finished one with the
+  fewest queued, so the queues fill evenly; one still being built takes none.
+- **Taunts after / or !.** A taunt can be typed as its number after a `/` or a
+  `!` (`!11`), as well as on its own.
+- **Larger populations.** Besides the original's limits of 25 to 200, a game
+  can be set up with a population limit of 250 to 500 in steps of 50, and of
+  600 to 1000 in steps of 100. The computer players' scripts, written for
+  limits up to 200, play such a game by their plan for 200, with the figures
+  that plan sets by population (the limit, the most soldiers it keeps, its
+  shares of the population) scaled to the game's limit.
+
+## Fights
+
+- **Aggressive soldiers join in.** An idle unit on the Aggressive stance
+  comes to help one of its side struck anywhere within its own sight, not
+  only within three tiles. Defensive units keep the original's three.
+- **Volleys spread out.** Soldiers set on an enemy in the same moment begin
+  their first blow or shot up to six tenths of a second apart, so a line of
+  archers does not loose every arrow on the same instant.
+- **An army carries on.** Soldiers ordered to attack something that falls
+  before they reach it walk on to where it fell, rather than stopping where
+  they were going, and take on whatever they find there.
+
+## Where it runs
+
+- **Windows 10 and 11, macOS and Linux**, from the player's own CD.
+- **Android phones and tablets.** On a touch screen the game is played as
+  with a mouse: tap to click, hold to right-click, drag one finger to select,
+  two fingers to scroll the map, pinch to zoom. A press on a text field brings
+  up the phone's keyboard.
+- **The Nintendo Switch**, as homebrew. The left stick moves the pointer, the
+  right stick scrolls the map, A and B are the mouse buttons, plus is the game
+  menu, minus is chat, and the other buttons are the game's hotkeys. The touch
+  screen works as on a phone.
+
+## Large games
+
+Big battles stay smooth: eight computer players on a giant map, with armies
+and fleets that make nearly three thousand units and buildings in all, take
+about a third of a millisecond a game tick on a desktop machine.

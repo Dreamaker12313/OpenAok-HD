@@ -1,0 +1,1311 @@
+#include "EntityRenderer.h"
+#include "core/FixedMath.h"
+#include "Renderer.h"
+#include "Ground.h"
+#include "UIRenderer.h"
+#include "FogRenderer.h"
+#include "Placement.h"
+#include "Stipple.h"
+#include "ecs/components/Transform.h"
+#include "ecs/components/Sprite.h"
+#include "ecs/components/SpritePieces.h"
+#include "ecs/components/Path.h"
+#include "ecs/components/Selectable.h"
+#include "ecs/components/Health.h"
+#include "ecs/components/Doppelganger.h"
+#include "ecs/components/Owner.h"
+#include "ecs/components/Waypoints.h"
+#include "ecs/components/Building.h"
+#include "ecs/components/Identity.h"
+#include "ecs/components/RallyPoint.h"
+#include "ecs/components/PartOf.h"
+#include "ecs/components/Animation.h"
+#include "ecs/components/Garrison.h"
+#include "ecs/BuildingGeometry.h"
+#include "ecs/Walls.h"
+#include "ecs/Players.h"
+#include "ecs/Vision.h"
+#include "core/ConfigManager.h"
+#include "core/Media.h"
+#include "core/IsometricMath.h"
+#include "hal/GraphicCache.h"
+#include "hal/TextureManager.h"
+#include "physics/Grid.h"
+#include <SDL2/SDL.h>
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+
+namespace Rendering {
+
+namespace {
+
+// How a selected thing is marked: a one-pixel white outline on the ground
+// under it, a 24 by 2 hit point bar
+// of pure green over pure red floating above it, and its control group's
+// digit (interfac.drs 50403, one frame per digit) to its left.
+constexpr int kHpBarWidth = 24;
+constexpr int kHpBarHeight = 2;
+constexpr uint32_t kGroupDigits = 50403;
+// More than a building's art is ever set off its position, in tiles each
+// way (EntityRenderer::ArtOffset: half its footprint's lopsidedness).
+constexpr float kMostArtOffset = 4.0f;
+// The dat's graphic layers drawn on the ground, under whatever stands there,
+// and under a lifted sprite rather than with it: the shadows', the dead's and
+// the stumps' (10) and below.
+constexpr int kGroundLayer = 10;
+
+struct SelectionMark {
+    int sx = 0, sy = 0;           // the pixel its outline is centred on
+    float rx = 0.2f, ry = 0.2f;   // the dat's outline radii, in tiles
+    bool round = true;
+    bool bar = true;
+    float bar_height = 2.0f;      // the dat's, in half tiles
+    int hp = 0, max_hp = 0;
+    int group = 0;
+    SDL_Color colour{255, 255, 255, 255};   // palette index 255
+};
+
+// The flash on what an order was given at. The view keeps eight. Each lasts
+// 1500 ms of the wall clock and is off for every other 256 ms, so the thing
+// shows three times; while on, its selection outline is drawn whether it is
+// selected or not, in pure green (palette index 241), and nothing else of a
+// selection with it -- no hit point bar, no group.
+struct Flashing {
+    entt::entity target = entt::null;
+    uint32_t started = 0;   // SDL ticks
+    bool live = false;
+};
+constexpr size_t kFlashSlots = 8;
+constexpr uint32_t kFlashMs = 1500;
+constexpr uint32_t kFlashBlinkBit = 0x100;
+constexpr size_t kFlashColour = 0xf1;
+
+std::array<Flashing, kFlashSlots>& Flashes() {
+    static std::array<Flashing, kFlashSlots> flashes;
+    return flashes;
+}
+
+// The ellipse a circle on the ground makes in the isometric view, rasterised
+// one pixel wide: every column and every row it crosses gets the pixel on its
+// rim nearest the centre, which leaves no gaps where it runs steep or flat.
+// The centre sits half a pixel above the foot row.
+void PlotEllipse(std::vector<SDL_Point>& out, int cx, int cy, float a, float b) {
+    if (a < 1.0f || b < 1.0f) return;
+    const float fy = static_cast<float>(cy) - 0.5f;
+    const int span_x = static_cast<int>(a);
+    for (int dx = -span_x; dx <= span_x; ++dx) {
+        const float t = static_cast<float>(dx) / a;
+        const float h = b * std::sqrt(std::max(0.0f, 1.0f - t * t));
+        out.push_back({cx + dx, static_cast<int>(std::ceil(fy - h))});
+        out.push_back({cx + dx, static_cast<int>(std::floor(fy + h))});
+    }
+    const int top = static_cast<int>(std::ceil(fy - b));
+    const int bottom = static_cast<int>(std::floor(fy + b));
+    for (int y = top; y <= bottom; ++y) {
+        const float t = (static_cast<float>(y) - fy) / b;
+        const float w = a * std::sqrt(std::max(0.0f, 1.0f - t * t));
+        out.push_back({static_cast<int>(std::ceil(static_cast<float>(cx) - w)), y});
+        out.push_back({static_cast<int>(std::floor(static_cast<float>(cx) + w)), y});
+    }
+}
+
+// One pixel of the frame in the world's pixels at the view's zoom, never less
+// than one: a mark this thick stays a pixel wide however far out the view is
+// zoomed, where a world pixel would thin to nothing.
+float FramePixel(SDL_Renderer* r) {
+    float zoom = 1.0f, unused = 1.0f;
+    SDL_RenderGetScale(r, &zoom, &unused);
+    return zoom < 1.0f ? 1.0f / zoom : 1.0f;
+}
+
+// `points` as squares `t` world pixels wide, each about its pixel's centre.
+void DrawDots(SDL_Renderer* r, const std::vector<SDL_Point>& points, float t) {
+    static std::vector<SDL_FRect> rects;
+    rects.clear();
+    const float from = 0.5f - t / 2.0f;
+    for (const SDL_Point& p : points) {
+        rects.push_back({static_cast<float>(p.x) + from, static_cast<float>(p.y) + from, t, t});
+    }
+    SDL_RenderFillRectsF(r, rects.data(), static_cast<int>(rects.size()));
+}
+
+// The pixels of the line from a to b, one for each step along its longer
+// axis.
+void PlotLine(std::vector<SDL_Point>& out, SDL_FPoint a, SDL_FPoint b) {
+    const float dx = b.x - a.x, dy = b.y - a.y;
+    const int steps = static_cast<int>(std::ceil(std::max(std::fabs(dx), std::fabs(dy))));
+    for (int i = 0; i <= steps; ++i) {
+        const float t = steps > 0 ? static_cast<float>(i) / static_cast<float>(steps) : 0.0f;
+        out.push_back({static_cast<int>(std::floor(a.x + dx * t)), static_cast<int>(std::floor(a.y + dy * t))});
+    }
+}
+
+void DrawOutline(SDL_Renderer* r, const SelectionMark& m, std::vector<SDL_Point>& scratch) {
+    constexpr float kHalfW = Core::IsometricMath::TILE_WIDTH / 2.0f;
+    constexpr float kHalfH = Core::IsometricMath::TILE_HEIGHT / 2.0f;
+    SDL_SetRenderDrawColor(r, m.colour.r, m.colour.g, m.colour.b, 255);
+    const float t = FramePixel(r);
+    if (m.round) {
+        // A circle of radius r tiles reaches r*sqrt(2) half tiles each way
+        // on screen, the world's axes being the screen's diagonals.
+        const float reach = std::sqrt(2.0f) * 0.5f * (m.rx + m.ry);
+        scratch.clear();
+        PlotEllipse(scratch, m.sx, m.sy, reach * kHalfW, reach * kHalfH);
+        if (t > 1.0f) {
+            DrawDots(r, scratch, t);
+        } else {
+            SDL_RenderDrawPoints(r, scratch.data(), static_cast<int>(scratch.size()));
+        }
+        return;
+    }
+    // A square outline is the diamond its radii make on the ground.
+    const float x = static_cast<float>(m.sx);
+    const float y = static_cast<float>(m.sy);
+    const SDL_FPoint corners[5] = {
+        {x + (m.ry - m.rx) * kHalfW, y - (m.rx + m.ry) * kHalfH},
+        {x + (m.rx + m.ry) * kHalfW, y + (m.rx - m.ry) * kHalfH},
+        {x + (m.rx - m.ry) * kHalfW, y + (m.rx + m.ry) * kHalfH},
+        {x - (m.rx + m.ry) * kHalfW, y + (m.ry - m.rx) * kHalfH},
+        {x + (m.ry - m.rx) * kHalfW, y - (m.rx + m.ry) * kHalfH},
+    };
+    if (t > 1.0f) {
+        scratch.clear();
+        for (int i = 0; i < 4; ++i) PlotLine(scratch, corners[i], corners[i + 1]);
+        DrawDots(r, scratch, t);
+    } else {
+        SDL_RenderDrawLinesF(r, corners, 5);
+    }
+}
+
+// The bar's top edge stands `bar_height` half tiles above the outline's top
+// corner -- 58 pixels over a footman's feet, 67 over a camel's -- and its
+// green part is the share of hit points left.
+void DrawHealthBar(SDL_Renderer* r, const SelectionMark& m) {
+    if (!m.bar || m.max_hp <= 0) return;
+    constexpr float kHalfH = Core::IsometricMath::TILE_HEIGHT / 2.0f;
+    const float rise = (m.rx + m.ry + m.bar_height) * kHalfH;
+    const int top = static_cast<int>(std::floor(static_cast<float>(m.sy) - rise));
+    const int left = m.sx - kHpBarWidth / 2;
+    const int hp = std::clamp(m.hp, 0, m.max_hp);
+    int green = hp * kHpBarWidth / m.max_hp;
+    if (hp > 0 && green == 0) green = 1;
+    // Zoomed out, as many of the frame's pixels high and at least one wide
+    // in each colour that shows.
+    const float t = FramePixel(r);
+    const float high = static_cast<float>(kHpBarHeight) * t;
+    const float green_w = green > 0 ? std::max(static_cast<float>(green), t) : 0.0f;
+    if (green > 0) {
+        SDL_SetRenderDrawColor(r, 0, 255, 0, 255);
+        const SDL_FRect g{static_cast<float>(left), static_cast<float>(top), green_w, high};
+        SDL_RenderFillRectF(r, &g);
+    }
+    if (green < kHpBarWidth) {
+        SDL_SetRenderDrawColor(r, 255, 0, 0, 255);
+        const float red_w = std::max(static_cast<float>(kHpBarWidth) - green_w, t);
+        const SDL_FRect red{static_cast<float>(left) + static_cast<float>(kHpBarWidth) - red_w,
+                            static_cast<float>(top), red_w, high};
+        SDL_RenderFillRectF(r, &red);
+    }
+}
+
+// The group's digit sits level with the feet, a little way left of where
+// the outline's left corner would be.
+void DrawGroupNumber(SDL_Renderer* r, const SelectionMark& m) {
+    if (m.group < 1 || m.group > 9) return;
+    const HAL::GraphicAtlas* digits = HAL::GraphicCache::Get().GetInterfaceAtlas(kGroupDigits);
+    if (digits == nullptr || digits->base == nullptr) return;
+    const size_t frame = static_cast<size_t>(m.group - 1);
+    if (frame >= digits->frames.size()) return;
+    const HAL::GraphicFrame& gf = digits->frames[frame];
+    constexpr float kHalfW = Core::IsometricMath::TILE_WIDTH / 2.0f;
+    const int left_corner = static_cast<int>(std::lround((m.rx + m.ry) * kHalfW));
+    const SDL_Rect dest{m.sx - left_corner - 6 - gf.hotspot_x, m.sy - 7 - gf.hotspot_y,
+                        gf.rect.w, gf.rect.h};
+    SDL_RenderCopy(r, digits->base, &gf.rect, &dest);
+}
+
+// World markers drawn by graphic id, not as units: a move order's arrows
+// (MOVEX) and the small flag that marks a waypoint or a building's gather
+// point (WAYPT). Ten at most.
+constexpr int kMoveMarkerGraphic = 2961;
+constexpr int kWaypointGraphic = 2962;
+constexpr size_t kMaxMarkers = 10;
+
+struct Marker {
+    float wx = 0.0f, wy = 0.0f;
+    uint32_t started = 0;   // SDL ticks
+};
+
+std::vector<Marker>& Markers() {
+    static std::vector<Marker> markers;
+    return markers;
+}
+
+struct RenderEntry {
+    float depth;
+    entt::entity ent;
+    void* tex_ptr;
+
+    bool is_selected;
+    float sel_sx, sel_sy;
+    int mark = -1;       // its SelectionMark, or -1
+
+    int sort_bias;
+
+    void* shadow_tex;
+    bool shadow_flip;
+    SDL_Rect shadow_src;
+    SDL_FRect shadow_dest;
+    void* outline_tex;
+    SDL_Rect outline_src;
+    int outline_player;
+
+    SDL_Rect src;
+    SDL_FRect dest;
+    const HAL::GraphicAtlas* atlas;
+    int frame;
+    uint32_t fallback_color;
+    float fallback_w, fallback_h;
+    bool flip_h;
+    // Drawn at ground level, under the fog, with the ground (FogRenderer.h).
+    bool ground;
+    // Standing on ground the player has explored but does not see now:
+    // dithered whole.
+    bool fogged;
+    // A piece of the building being placed (Placement.h): 0 none, else which
+    // of the blitter's masks goes over it -- kGhostClear, or the pulsing red
+    // of the building's own piece or of the rest.
+    uint8_t ghost;
+};
+constexpr uint8_t kGhostClear = 1;
+constexpr uint8_t kGhostBlockedMain = 2;
+constexpr uint8_t kGhostBlocked = 3;
+// Game time as the frame was gathered, for the pulsing red.
+uint64_t g_game_ms = 0;
+
+// This frame's entries and selection marks, built by DrawGroundLevel and
+// drawn by it and DrawStanding; kept between frames so they never reallocate.
+std::vector<RenderEntry>& Entries() {
+    static std::vector<RenderEntry> entries;
+    return entries;
+}
+
+std::vector<SelectionMark>& Marks() {
+    static std::vector<SelectionMark> marks;
+    return marks;
+}
+
+// Whose colour a sprite is drawn in: its owner's, or for a picture the fog
+// keeps, its owner's then; player 1's for what belongs to nobody.
+int ColourOf(const entt::registry& registry, entt::entity entity) {
+    if (const auto* owner = registry.try_get<ECS::Components::Owner>(entity)) return owner->player_id;
+    if (const auto* picture = registry.try_get<ECS::Components::Doppelganger>(entity)) {
+        return picture->colour != Core::PLAYER_GAIA ? picture->colour : 1;
+    }
+    return 1;
+}
+
+// How many outlines the last frame drew.
+int g_outlines_drawn = 0;
+
+std::vector<SDL_Point>& RingPoints() {
+    static std::vector<SDL_Point> points;
+    return points;
+}
+
+// Whether the dat draws an SLP at ground level: every graphic using it on
+// the ground layers (kGroundLayer and under) -- farms, rubble, cliffs,
+// foundations, stumps, the dead, shadows. Those layers are drawn first,
+// through the ground's fog regions, so whatever stands or walks there is
+// drawn over them.
+bool GroundLevel(int slp_id) {
+    static const std::vector<uint8_t> table = [] {
+        std::vector<uint8_t> t;
+        auto& cfg = Core::ConfigManager::Get();
+        constexpr int kGraphicIds = 8192;   // the dat holds 5,577
+        for (int id = 0; id < kGraphicIds; ++id) {
+            const auto info = cfg.GetGraphic(id);
+            if (!info.Valid()) continue;
+            const auto slp = static_cast<size_t>(info.slp_id);
+            if (slp >= t.size()) t.resize(slp + 1, 0);
+            // 1 ground, 2 standing; a standing use wins.
+            t[slp] = std::max<uint8_t>(t[slp], info.layer <= kGroundLayer ? 1 : 2);
+        }
+        return t;
+    }();
+    return slp_id >= 0 && static_cast<size_t>(slp_id) < table.size() &&
+           table[static_cast<size_t>(slp_id)] == 1;
+}
+
+// Draws one entry's sprite, or its placeholder.
+void DrawSprite(SDL_Renderer* sdl_r, const RenderEntry& e) {
+    if (e.tex_ptr) {
+        SDL_Texture* tex = static_cast<SDL_Texture*>(e.tex_ptr);
+        if (e.flip_h) {
+            SDL_RenderCopyExF(sdl_r, tex, &e.src, &e.dest, 0.0, nullptr, SDL_FLIP_HORIZONTAL);
+        } else {
+            SDL_RenderCopyF(sdl_r, tex, &e.src, &e.dest);
+        }
+    } else if (e.fallback_w > 0.0f && e.fallback_h > 0.0f) {
+        uint8_t a = (e.fallback_color >> 24) & 0xFF;
+        uint8_t r = (e.fallback_color >> 16) & 0xFF;
+        uint8_t g = (e.fallback_color >> 8) & 0xFF;
+        uint8_t b = e.fallback_color & 0xFF;
+        SDL_SetRenderDrawColor(sdl_r, r, g, b, a);
+
+        SDL_FRect dest = {
+            e.sel_sx - e.fallback_w / 2.0f,
+            e.sel_sy - e.fallback_h / 2.0f,
+            static_cast<float>(e.fallback_w),
+            static_cast<float>(e.fallback_h)
+        };
+        SDL_RenderFillRectF(sdl_r, &dest);
+    }
+}
+
+// One texture of an entry into the fog's layer: in black, or wiping it.
+void DrawInto(SDL_Renderer* sdl_r, SDL_Texture* tex, const RenderEntry& e, bool wipe) {
+    Uint8 r = 255, g = 255, b = 255;
+    SDL_BlendMode mode = SDL_BLENDMODE_BLEND;
+    SDL_GetTextureColorMod(tex, &r, &g, &b);
+    SDL_GetTextureBlendMode(tex, &mode);
+    if (wipe) SDL_SetTextureBlendMode(tex, FogRenderer::EraseBlend());
+    else SDL_SetTextureColorMod(tex, 0, 0, 0);
+    if (e.flip_h) {
+        SDL_RenderCopyExF(sdl_r, tex, &e.src, &e.dest, 0.0, nullptr, SDL_FLIP_HORIZONTAL);
+    } else {
+        SDL_RenderCopyF(sdl_r, tex, &e.src, &e.dest);
+    }
+    SDL_SetTextureColorMod(tex, r, g, b);
+    SDL_SetTextureBlendMode(tex, mode);
+}
+
+} // namespace
+
+void EntityRenderer::AddMoveMarker(float wx, float wy) {
+    auto& markers = Markers();
+    if (markers.size() >= kMaxMarkers) markers.erase(markers.begin());
+    markers.push_back({wx, wy, SDL_GetTicks()});
+}
+
+void EntityRenderer::ClearMarkers() {
+    Markers().clear();
+}
+
+void EntityRenderer::Flash(const entt::registry& registry, entt::entity target, bool ends_others) {
+    if (!registry.valid(target)) return;
+    // A building's piece stands for the building.
+    if (const auto* part = registry.try_get<ECS::Components::PartOf>(target)) {
+        if (registry.valid(part->building)) target = part->building;
+    }
+    auto& flashes = Flashes();
+    // An order's flash ends whatever flash of the same kind is showing; a
+    // conversion's ends none of them.
+    Flashing* slot = nullptr;
+    for (Flashing& f : flashes) {
+        if (f.live && ends_others) f.live = false;
+        if (!f.live) slot = &f;
+    }
+    if (slot == nullptr) return;
+    *slot = {target, SDL_GetTicks(), true};
+}
+
+void EntityRenderer::ClearFlashes() {
+    for (Flashing& f : Flashes()) f.live = false;
+}
+
+void EntityRenderer::ArtOffset(const entt::registry& registry, entt::entity entity, float& ox,
+                               float& oy) {
+    ox = 0.0f;
+    oy = 0.0f;
+    entt::entity building = entity;
+    if (const auto* part = registry.try_get<ECS::Components::PartOf>(entity)) {
+        if (!registry.valid(part->building)) return;
+        building = part->building;
+    }
+    if (!registry.all_of<ECS::Components::Building, ECS::Components::Identity>(building)) return;
+    const int unit_id = registry.get<ECS::Components::Identity>(building).unit_id;
+    // A gate's art is laid at its middle already, arch and posts (ecs/Walls).
+    if (ECS::Walls::IsGate(unit_id)) return;
+    const ECS::Buildings::Footprint f = ECS::Buildings::FootprintOf(unit_id);
+    ox = static_cast<float>(f.x.low + f.x.high) / 2.0f;
+    oy = static_cast<float>(f.y.low + f.y.high) / 2.0f;
+}
+
+namespace {
+
+// How far round a unit's art, in pixels, a click still lands on it.
+constexpr int kUnitMargin = 3;
+
+// The frontmost of `entries` -- those lying on the ground, or those standing
+// -- whose art holds the point: a building's or a tree's where it is opaque,
+// a unit's or an animal's as PickedByArt says.
+entt::entity PickIn(const entt::registry& registry, const std::vector<RenderEntry>& entries,
+                    float vx, float vy, bool ground) {
+    // Back to front as drawn: the last that covers the point is in front.
+    for (size_t i = entries.size(); i-- > 0;) {
+        const RenderEntry& e = entries[i];
+        if (e.ground != ground) continue;
+        if (e.ent == entt::null || e.ghost != 0 || e.atlas == nullptr) continue;
+        if (!registry.valid(e.ent)) continue;
+        const bool body = EntityRenderer::PickedByArt(registry, e.ent);
+        const float margin = body ? static_cast<float>(kUnitMargin) : 0.0f;
+        if (vx < e.dest.x - margin || vy < e.dest.y - margin ||
+            vx >= e.dest.x + e.dest.w + margin || vy >= e.dest.y + e.dest.h + margin) {
+            continue;
+        }
+        int fx = static_cast<int>(std::floor(vx - e.dest.x));
+        const int fy = static_cast<int>(std::floor(vy - e.dest.y));
+        if (e.flip_h) fx = static_cast<int>(e.dest.w) - 1 - fx;
+        const bool on = body ? e.atlas->Holds(e.frame, fx, fy, kUnitMargin)
+                             : e.atlas->Covers(e.frame, fx, fy);
+        if (!on) continue;
+        if (const auto* part = registry.try_get<ECS::Components::PartOf>(e.ent)) {
+            if (registry.valid(part->building)) return part->building;
+        }
+        if (!registry.all_of<ECS::Components::Selectable>(e.ent)) continue;
+        return e.ent;
+    }
+    return entt::null;
+}
+
+} // namespace
+
+bool EntityRenderer::PickedByArt(const entt::registry& registry, entt::entity entity) {
+    // Units and animals are what play an animation and can be hurt; a
+    // building's fall plays one but has no hit points.
+    return registry.all_of<ECS::Components::Animation, ECS::Components::Health>(entity) &&
+           !registry.all_of<ECS::Components::Building>(entity);
+}
+
+entt::entity EntityRenderer::PickAt(const entt::registry& registry, float vx, float vy) {
+    const auto& entries = Entries();
+    // What lies on the ground -- a Farm's field -- is drawn before everything
+    // standing, so anything standing on it is in front of it.
+    for (const bool ground : {false, true}) {
+        if (const entt::entity found = PickIn(registry, entries, vx, vy, ground); found != entt::null) {
+            return found;
+        }
+    }
+    return entt::null;
+}
+
+void EntityRenderer::DrawGroundLevel(ECS::Simulation& sim, Renderer& renderer, SDL_Renderer* sdl_r, float alpha) {
+    auto& registry = sim.GetRegistry();
+    // Whether an entity stands on ground the player sees only in fog: its
+    // tile, as ECS::Vision::Shows reads it, explored but not seen now.
+    const auto* vision = registry.ctx().find<ECS::Vision::Map>();
+    const bool fog_on = vision != nullptr && vision->reveal != Core::Reveal::AllVisible;
+    auto in_fog = [&](entt::entity entity) {
+        if (!fog_on || entity == entt::null) return false;
+        entt::entity subject = entity;
+        if (const auto* part = registry.try_get<ECS::Components::PartOf>(entity)) {
+            if (registry.valid(part->building)) subject = part->building;
+        }
+        const auto* at = registry.try_get<ECS::Components::Transform>(subject);
+        if (at == nullptr) return false;
+        return !ECS::Vision::Visible(registry, Core::LocalPlayer(), Physics::TileOf(at->position.x),
+                                     Physics::TileOf(at->position.y));
+    };
+    const auto& grid = sim.GetGrid();
+    auto view = registry.view<ECS::Components::Transform, ECS::Components::Sprite>();
+    
+    float margin = 200.0f;
+    float inv_zoom = 1.0f / renderer.camera_zoom;
+    float cull_min_x = -margin;
+    float cull_max_x = (renderer.view_w * inv_zoom) + margin;
+    float cull_min_y = -margin;
+    float cull_max_y = (renderer.view_h * inv_zoom) + margin;
+    float cx = renderer.camera_x;
+    float cy = renderer.camera_y;
+    
+    auto& entries = Entries();
+    entries.clear();
+    auto& marks = Marks();
+    marks.clear();
+    auto& cfg_ui = Core::ConfigManager::Get();
+    // What is flashing this frame: its outline shows, green.
+    static std::vector<entt::entity> flashing;
+    flashing.clear();
+    {
+        const uint32_t now = SDL_GetTicks();
+        for (Flashing& f : Flashes()) {
+            if (!f.live) continue;
+            const uint32_t elapsed = now - f.started;
+            if (elapsed > kFlashMs || !registry.valid(f.target)) {
+                f.live = false;
+            } else if ((elapsed & kFlashBlinkBit) == 0) {
+                flashing.push_back(f.target);
+            }
+        }
+    }
+    const HAL::PaletteColor flash_colour = HAL::GraphicCache::Get().GetPaletteColor(kFlashColour);
+    auto flashing_now = [&](entt::entity entity) {
+        return !flashing.empty() &&
+               std::find(flashing.begin(), flashing.end(), entity) != flashing.end();
+    };
+    // What marks a selected or flashing entity, from its dat entry.
+    auto mark_of = [&](entt::entity entity, float sx, float sy, bool selected, bool flash) -> int {
+        SelectionMark m;
+        if (flash) m.colour = SDL_Color{flash_colour.r, flash_colour.g, flash_colour.b, 255};
+        // A gate's art is laid at its footprint's middle by its pieces, off
+        // its own tile (ArtOffset); its outline and bar go there too.
+        if (const auto* id = registry.try_get<ECS::Components::Identity>(entity);
+            id != nullptr && ECS::Walls::IsGate(id->unit_id)) {
+            const ECS::Buildings::Footprint f = ECS::Buildings::FootprintOf(id->unit_id);
+            const float dx = static_cast<float>(f.x.low + f.x.high) / 2.0f;
+            const float dy = static_cast<float>(f.y.low + f.y.high) / 2.0f;
+            sx += (dx - dy) * (Core::IsometricMath::TILE_WIDTH / 2.0f);
+            sy += (dx + dy) * (Core::IsometricMath::TILE_HEIGHT / 2.0f);
+        }
+        m.sx = static_cast<int>(std::lround(sx));
+        m.sy = static_cast<int>(std::lround(sy));
+        if (const auto* id = registry.try_get<ECS::Components::Identity>(entity)) {
+            Core::PlayerId owner = 0;
+            if (const auto* o = registry.try_get<ECS::Components::Owner>(entity)) owner = o->player_id;
+            const int art = ECS::Players::ArtOf(registry, owner, id->unit_id);
+            const auto* ui = cfg_ui.GetUnitInterface(art);
+            if (ui == nullptr) ui = cfg_ui.GetUnitInterface(id->unit_id);
+            if (ui != nullptr) {
+                m.rx = ui->outline_x;
+                m.ry = ui->outline_y;
+                m.round = ui->obstruction == 5;
+                m.bar_height = ui->hp_bar_height;
+                m.bar = ui->selection_effect == 0 || ui->selection_effect == 1 ||
+                        ui->selection_effect == 5;
+            }
+        }
+        if (const auto* hp = registry.try_get<ECS::Components::Health>(entity)) {
+            m.hp = hp->current_hp;
+            m.max_hp = hp->max_hp;
+        } else {
+            m.bar = false;
+        }
+        if (const auto* sel = registry.try_get<ECS::Components::Selectable>(entity)) {
+            m.group = sel->group;
+        }
+        if (!selected) {
+            m.bar = false;
+            m.group = 0;
+        }
+        marks.push_back(m);
+        return static_cast<int>(marks.size()) - 1;
+    };
+    
+    // Sprites come from the DRS archives, decoded and packed into one atlas
+    // per graphic.
+    auto& graphics = HAL::GraphicCache::Get();
+    
+    view.each([&](auto entity, const auto& t, auto& sprite) {
+        float lx = t.previous_position.x.ToFloat() + (t.position.x.ToFloat() - t.previous_position.x.ToFloat()) * alpha;
+        float ly = t.previous_position.y.ToFloat() + (t.position.y.ToFloat() - t.previous_position.y.ToFloat()) * alpha;
+        // Off the screen to either side, or above it, whatever its art's
+        // offset and however high its ground (which only lifts it): not
+        // looked at further.
+        {
+            const float slack_x = 2.0f * kMostArtOffset * (Core::IsometricMath::TILE_WIDTH / 2.0f);
+            const float slack_y = 2.0f * kMostArtOffset * (Core::IsometricMath::TILE_HEIGHT / 2.0f);
+            const float px = (lx - ly) * (Core::IsometricMath::TILE_WIDTH / 2.0f) - cx;
+            const float py = (lx + ly) * (Core::IsometricMath::TILE_HEIGHT / 2.0f) - cy;
+            if (px + slack_x < cull_min_x || px - slack_x > cull_max_x || py + slack_y < cull_min_y) return;
+        }
+        // A building stands about its footprint's middle, its art, outline
+        // and health bar alike.
+        {
+            float ox = 0.0f, oy = 0.0f;
+            ArtOffset(registry, entity, ox, oy);
+            lx += ox;
+            ly += oy;
+        }
+        
+        // Inline WorldToScreen, standing on the ground's height there.
+        float sx = (lx - ly) * (Core::IsometricMath::TILE_WIDTH / 2.0f) - cx;
+        float sy = (lx + ly) * (Core::IsometricMath::TILE_HEIGHT / 2.0f) - cy -
+                   Ground::HeightPx(grid, lx, ly);
+        
+        // Fast frustum culling
+        if (sx < cull_min_x || sx > cull_max_x || sy < cull_min_y || sy > cull_max_y) {
+            return;
+        }
+        // What the player at this machine cannot see is not drawn.
+        if (!ECS::Vision::Shows(registry, Core::LocalPlayer(), entity)) return;
+        
+        RenderEntry e{};
+        e.depth = lx + ly;
+        e.ent = entity;
+        e.fogged = in_fog(entity);
+        e.is_selected = registry.any_of<ECS::Components::Selectable>(entity) && registry.get<ECS::Components::Selectable>(entity).is_selected;
+        const bool flash = flashing_now(entity);
+        e.sort_bias = sprite.sort_bias;
+        e.shadow_tex = nullptr;
+        e.shadow_flip = false;
+        e.shadow_src = {0, 0, 0, 0};
+        e.sel_sx = sx;
+        e.sel_sy = sy;
+        e.mark = -1;
+        
+        // A composite graphic -- a ship's hull, sails and wake -- draws as its
+        // pieces, each from its own atlas with its own facings, in the dat's
+        // layer order. The first piece carries the selection and health bar.
+        if (const auto* pieces = registry.try_get<ECS::Components::SpritePieces>(entity)) {
+            const int owner_player = ColourOf(registry, entity);
+            bool first = true;
+            for (int p = 0; p < pieces->count; ++p) {
+                const ECS::Components::SpritePiece& piece = pieces->piece[p];
+                const HAL::GraphicAtlas* piece_atlas =
+                    graphics.GetAtlas(static_cast<uint32_t>(piece.slp_id));
+                if (!piece_atlas) continue;
+                const HAL::ArtPlace art = graphics.Art(static_cast<uint32_t>(piece.slp_id), owner_player);
+                // A piece that is all shadow -- a hawk's, under it on the
+                // ground -- draws in the shadow pass.
+                const HAL::ArtPlace shadow =
+                    art.page == nullptr ? graphics.Shadow(static_cast<uint32_t>(piece.slp_id)) : HAL::ArtPlace{};
+                if (art.page == nullptr && shadow.page == nullptr) continue;
+                // Of n facings the first n/2 + 1 are stored, clockwise from
+                // south, and the rest mirror them.
+                const int n = std::max(1, piece.angles);
+                int angle = Core::FixedMath::Facet(sprite.heading, n);
+                bool flip = false;
+                if (n > 1 && angle > n / 2) {
+                    flip = true;
+                    angle = n - angle;
+                }
+                const int per_angle = std::max(1, piece.frames_per_angle);
+                const int frame = angle * per_angle + sprite.current_frame % per_angle;
+                if (frame < 0 || static_cast<size_t>(frame) >= piece_atlas->frames.size()) continue;
+                const HAL::GraphicFrame& gf = piece_atlas->frames[static_cast<size_t>(frame)];
+                if (gf.rect.w <= 0) continue;
+                // Lifted, a flier's pieces of the dat's ground layers -- its
+                // shadow -- stay on the ground under it.
+                const bool on_ground = piece.bias / ECS::Components::SpritePieces::kMax <= kGroundLayer;
+                const int lift = on_ground ? 0 : sprite.lift_px;
+                if (art.page == nullptr) {
+                    RenderEntry cast = e;
+                    const int ax = flip ? (gf.rect.w - gf.hotspot_x) : gf.hotspot_x;
+                    cast.shadow_tex = shadow.PageOf(gf.rect);
+                    cast.shadow_src = shadow.On(gf.rect);
+                    cast.shadow_flip = flip;
+                    cast.shadow_dest.x = sx + static_cast<float>(piece.offset_x - ax);
+                    cast.shadow_dest.y = sy + static_cast<float>(piece.offset_y - gf.hotspot_y - lift);
+                    cast.shadow_dest.w = static_cast<float>(gf.rect.w);
+                    cast.shadow_dest.h = static_cast<float>(gf.rect.h);
+                    entries.push_back(cast);
+                    continue;
+                }
+                RenderEntry part = e;
+                part.sort_bias = sprite.sort_bias + piece.bias;
+                part.is_selected = first && e.is_selected;
+                if (first && (e.is_selected || flash)) {
+                    part.mark = mark_of(entity, sx, sy, e.is_selected, flash);
+                }
+                part.tex_ptr = art.PageOf(gf.rect);
+                part.ground = GroundLevel(piece.slp_id);
+                part.atlas = piece_atlas;
+                part.frame = frame;
+                part.src = art.On(gf.rect);
+                part.flip_h = flip;
+                const int anchor_x = flip ? (gf.rect.w - gf.hotspot_x) : gf.hotspot_x;
+                part.dest.x = sx + static_cast<float>(piece.offset_x - anchor_x);
+                part.dest.y = sy + static_cast<float>(piece.offset_y - gf.hotspot_y - lift);
+                part.dest.w = static_cast<float>(gf.rect.w);
+                part.dest.h = static_cast<float>(gf.rect.h);
+                part.outline_player = owner_player;
+                const HAL::ArtPlace outline = graphics.Outline(static_cast<uint32_t>(piece.slp_id));
+                part.outline_tex = outline.PageOf(gf.rect);
+                part.outline_src = outline.On(gf.rect);
+                first = false;
+                entries.push_back(part);
+            }
+            return;
+        }
+
+        const HAL::GraphicAtlas* atlas = sprite.slp_id >= 0
+            ? graphics.GetAtlas(static_cast<uint32_t>(sprite.slp_id))
+            : nullptr;
+
+        // Pick the frame: the nearest of the graphic's angles, of which the
+        // first half and one more are stored and the rest mirror them -- of
+        // eight, North-East, East and South-East mirror North-West, West and
+        // South-West. An SLP storing one angle fewer -- an arrow's, 16 of 32
+        // -- shows its last for the one it lacks.
+        if (sprite.is_file_sprite) {
+            const int n = std::max(1, sprite.angles);
+            int angle_index = Core::FixedMath::Facet(sprite.heading, n);
+            sprite.flip_h = false;
+            if (n > 1 && angle_index > n / 2) {
+                sprite.flip_h = true;
+                angle_index = n - angle_index;
+            }
+            if (atlas != nullptr) {
+                const int stored = static_cast<int>(atlas->frames.size()) / std::max(1, sprite.frames_per_angle);
+                if (stored > 0 && angle_index >= stored) angle_index = stored - 1;
+            }
+            sprite.slp_frame = angle_index * sprite.frames_per_angle + sprite.current_frame;
+        }
+        
+        e.flip_h = sprite.flip_h;
+        e.outline_tex = nullptr;
+        e.outline_player = 1;
+        e.tex_ptr = nullptr;
+
+        // A shadow sprite draws its graphic's shadow layer and nothing else, so
+        // it lands in the shadow pass beneath every piece of the building.
+        if (sprite.is_shadow) {
+            const HAL::ArtPlace shadow = atlas
+                ? graphics.Shadow(static_cast<uint32_t>(sprite.slp_id))
+                : HAL::ArtPlace{};
+            if (shadow.page && !atlas->frames.empty()) {
+                const HAL::GraphicFrame& sgf = atlas->frames[0];
+                if (sgf.rect.w > 0) {
+                    // Cropping to a sub-rectangle moves the anchor with it: the
+                    // hotspot is expressed against the full frame.
+                    SDL_Rect src = shadow.On(sgf.rect);
+                    int hx = sgf.hotspot_x;
+                    int hy = sgf.hotspot_y;
+                    if (sprite.sub_w > 0) {
+                        src.x += sprite.sub_x;
+                        src.y += sprite.sub_y;
+                        src.w = sprite.sub_w;
+                        src.h = sprite.sub_h;
+                        hx -= sprite.sub_x;
+                        hy -= sprite.sub_y;
+                    }
+                    const int ax = e.flip_h ? (src.w - hx) : hx;
+                    e.shadow_tex = shadow.PageOf(sgf.rect);
+                    e.shadow_src = src;
+                    e.shadow_flip = e.flip_h;
+                    e.shadow_dest.x = sx - static_cast<float>(ax);
+                    e.shadow_dest.y = sy - static_cast<float>(hy);
+                    e.shadow_dest.w = static_cast<float>(src.w);
+                    e.shadow_dest.h = static_cast<float>(src.h);
+                    entries.push_back(e);
+                }
+            }
+            return;
+        }
+
+        const int owner_player = ColourOf(registry, entity);
+        const HAL::ArtPlace art = atlas ? graphics.Art(static_cast<uint32_t>(sprite.slp_id), owner_player)
+                                        : HAL::ArtPlace{};
+        if (art.page && sprite.slp_frame >= 0
+            && static_cast<size_t>(sprite.slp_frame) < atlas->frames.size()
+            && atlas->frames[sprite.slp_frame].rect.w > 0) {
+            const HAL::GraphicFrame& gf = atlas->frames[sprite.slp_frame];
+            e.tex_ptr = art.PageOf(gf.rect);
+            e.ground = GroundLevel(sprite.slp_id);
+            e.atlas = atlas;
+            e.frame = sprite.slp_frame;
+            e.src = art.On(gf.rect);
+            // The hotspot is the texel that sits on the tile, from the SLP
+            // frame header. Mirroring a frame mirrors its hotspot too, so a
+            // flipped frame anchors at (width - hotspot_x).
+            const int anchor_x = e.flip_h ? (gf.rect.w - gf.hotspot_x) : gf.hotspot_x;
+            e.dest.x = sx - static_cast<float>(anchor_x);
+            e.dest.y = sy - static_cast<float>(gf.hotspot_y) -
+                       static_cast<float>(sprite.lift_px);
+            e.dest.w = static_cast<float>(gf.rect.w);
+            e.dest.h = static_cast<float>(gf.rect.h);
+            
+            e.outline_player = owner_player;
+            const HAL::ArtPlace outline = graphics.Outline(static_cast<uint32_t>(sprite.slp_id));
+            e.outline_tex = outline.PageOf(gf.rect);
+            e.outline_src = outline.On(gf.rect);
+            
+            // Companion shadow graphic, resolved once per graphic.
+            if (!sprite.shadow_resolved) {
+                sprite.shadow_resolved = true;
+                sprite.shadow_slp = Core::ConfigManager::Get().GetShadowSlp(sprite.slp_id);
+            }
+            if (sprite.shadow_slp >= 0) {
+                const HAL::GraphicAtlas* sh_atlas =
+                    graphics.GetAtlas(static_cast<uint32_t>(sprite.shadow_slp));
+                const HAL::ArtPlace shadow = sh_atlas ? graphics.Shadow(static_cast<uint32_t>(sprite.shadow_slp))
+                                                      : HAL::ArtPlace{};
+                if (shadow.page && !sh_atlas->frames.empty()) {
+                    const size_t sf = static_cast<size_t>(sprite.slp_frame) < sh_atlas->frames.size()
+                                    ? static_cast<size_t>(sprite.slp_frame) : 0;
+                    const HAL::GraphicFrame& sgf = sh_atlas->frames[sf];
+                    if (sgf.rect.w > 0) {
+                        // A graphic that is its own shadow -- a flag -- casts
+                        // it mirrored with its frame.
+                        const bool own = sprite.shadow_slp == sprite.slp_id;
+                        e.shadow_flip = own && e.flip_h;
+                        e.shadow_tex = shadow.PageOf(sgf.rect);
+                        e.shadow_src = shadow.On(sgf.rect);
+                        e.shadow_dest.x = sx - static_cast<float>(e.shadow_flip ? sgf.rect.w - sgf.hotspot_x
+                                                                                 : sgf.hotspot_x);
+                        e.shadow_dest.y = sy - static_cast<float>(sgf.hotspot_y);
+                        e.shadow_dest.w = static_cast<float>(sgf.rect.w);
+                        e.shadow_dest.h = static_cast<float>(sgf.rect.h);
+                    }
+                }
+            }
+        } else {
+            // No art: a flat placeholder rectangle (foundations, projectiles).
+            e.fallback_color = sprite.color;
+            e.fallback_w = static_cast<float>(sprite.width);
+            e.fallback_h = static_cast<float>(sprite.height);
+        }
+        
+        if (e.is_selected || flash) e.mark = mark_of(entity, sx, sy, e.is_selected, flash);
+        entries.push_back(e);
+    });
+    
+    // The order markers, depth-sorted with everything else: presentation
+    // only, timed on the wall clock.
+    {
+        auto& cfg = Core::ConfigManager::Get();
+        const uint32_t now = SDL_GetTicks();
+        auto add_marker = [&](int graphic, float wx, float wy, size_t frame, int player) {
+            const auto info = cfg.GetGraphic(graphic);
+            if (!info.Valid()) return;
+            const HAL::GraphicAtlas* atlas = graphics.GetAtlas(static_cast<uint32_t>(info.slp_id));
+            if (!atlas || frame >= atlas->frames.size()) return;
+            const HAL::ArtPlace art = graphics.Art(static_cast<uint32_t>(info.slp_id), player);
+            if (art.page == nullptr) return;
+            const HAL::GraphicFrame& gf = atlas->frames[frame];
+            if (gf.rect.w <= 1) return;
+            const float mx = (wx - wy) * (Core::IsometricMath::TILE_WIDTH / 2.0f) - cx;
+            const float my = (wx + wy) * (Core::IsometricMath::TILE_HEIGHT / 2.0f) - cy -
+                             Ground::HeightPx(grid, wx, wy);
+            if (mx < cull_min_x || mx > cull_max_x || my < cull_min_y || my > cull_max_y) return;
+            RenderEntry e{};
+            e.depth = wx + wy;
+            e.ent = entt::null;
+            e.tex_ptr = art.PageOf(gf.rect);
+            e.atlas = atlas;
+            e.frame = static_cast<int>(frame);
+            e.src = art.On(gf.rect);
+            e.dest = {mx - static_cast<float>(gf.hotspot_x), my - static_cast<float>(gf.hotspot_y),
+                      static_cast<float>(gf.rect.w), static_cast<float>(gf.rect.h)};
+            e.sel_sx = mx;
+            e.sel_sy = my;
+            entries.push_back(e);
+        };
+        // A move's arrows play through once and are gone.
+        const int move_ms = std::max(1, cfg.GetFrameMs(kMoveMarkerGraphic, 60));
+        auto& markers = Markers();
+        std::erase_if(markers, [&](const Marker& m) {
+            return (now - m.started) / static_cast<uint32_t>(move_ms) >=
+                   static_cast<uint32_t>(std::max(1, cfg.GetGraphic(kMoveMarkerGraphic).frame_count));
+        });
+        for (const Marker& m : markers) {
+            add_marker(kMoveMarkerGraphic, m.wx, m.wy,
+                       (now - m.started) / static_cast<uint32_t>(move_ms), Core::LocalPlayer());
+        }
+        // The selected building's gather point: the waypoint flag, waving,
+        // in its owner's colour.
+        const int flag_ms = std::max(1, cfg.GetFrameMs(kWaypointGraphic, 100));
+        const int flag_frames = std::max(1, cfg.GetGraphic(kWaypointGraphic).frame_count);
+        auto rallies = registry.view<ECS::Components::RallyPoint, ECS::Components::Selectable,
+                                     ECS::Components::Owner>();
+        for (auto b : rallies) {
+            if (!rallies.get<ECS::Components::Selectable>(b).is_selected) continue;
+            const Core::PlayerId owner = rallies.get<ECS::Components::Owner>(b).player_id;
+            if (owner != Core::LocalPlayer()) continue;
+            const auto& rally = rallies.get<ECS::Components::RallyPoint>(b);
+            add_marker(kWaypointGraphic, rally.at.x.ToFloat(), rally.at.y.ToFloat(),
+                       (now / static_cast<uint32_t>(flag_ms)) % static_cast<uint32_t>(flag_frames),
+                       owner);
+        }
+        // A selected unit's waypoints: the same flag at the point it is
+        // walking to and at each laid after it.
+        auto routed = registry.view<ECS::Components::Waypoints, ECS::Components::Selectable,
+                                    ECS::Components::Owner>();
+        for (auto u : routed) {
+            if (!routed.get<ECS::Components::Selectable>(u).is_selected) continue;
+            const Core::PlayerId owner = routed.get<ECS::Components::Owner>(u).player_id;
+            if (owner != Core::LocalPlayer()) continue;
+            const uint32_t frame = (now / static_cast<uint32_t>(flag_ms)) % static_cast<uint32_t>(flag_frames);
+            if (const auto* path = registry.try_get<ECS::Components::Path>(u); path != nullptr && path->has_goal) {
+                add_marker(kWaypointGraphic, path->goal.x.ToFloat(), path->goal.y.ToFloat(), frame, owner);
+            }
+            const auto& route = routed.get<ECS::Components::Waypoints>(u);
+            for (int i = 0; i < route.count; ++i) {
+                const auto& p = route.points[static_cast<size_t>(i)];
+                add_marker(kWaypointGraphic, p.x.ToFloat(), p.y.ToFloat(), frame, owner);
+            }
+        }
+    }
+
+    // The building being placed, depth-sorted among the world's own pieces
+    // (rendering/Placement.h).
+    {
+        static std::vector<Placement::Piece> pieces;
+        Placement::Outline outline;
+        g_game_ms = sim.Tick() * 16;
+        if (Placement::Collect(sim, renderer, pieces, outline)) {
+            if (outline.shown) {
+                SelectionMark m;
+                m.sx = static_cast<int>(std::lround(
+                    (outline.wx - outline.wy) * (Core::IsometricMath::TILE_WIDTH / 2.0f) - cx));
+                m.sy = static_cast<int>(std::lround(
+                    (outline.wx + outline.wy) * (Core::IsometricMath::TILE_HEIGHT / 2.0f) - cy -
+                    Ground::HeightPx(grid, outline.wx, outline.wy)));
+                m.rx = outline.rx;
+                m.ry = outline.ry;
+                m.round = outline.round;
+                m.bar = false;
+                const HAL::PaletteColor c = graphics.GetPaletteColor(static_cast<size_t>(
+                    outline.clear ? Placement::kOutlineClear : Placement::kOutlineBlocked));
+                m.colour = SDL_Color{c.r, c.g, c.b, 255};
+                marks.push_back(m);
+                // An entry of its own, under the pieces standing there, so the
+                // outline shows even with no art: a Farm's field (SLP 419) is
+                // not on the disc.
+                RenderEntry e{};
+                e.depth = outline.wx + outline.wy;
+                e.sort_bias = -1;
+                e.ent = entt::null;
+                e.mark = static_cast<int>(marks.size()) - 1;
+                entries.push_back(e);
+            }
+            for (const Placement::Piece& piece : pieces) {
+                const HAL::GraphicFrame& gf = piece.atlas->frames[static_cast<size_t>(piece.frame)];
+                const float px = (piece.wx - piece.wy) * (Core::IsometricMath::TILE_WIDTH / 2.0f) - cx;
+                const float py = (piece.wx + piece.wy) * (Core::IsometricMath::TILE_HEIGHT / 2.0f) -
+                                 cy - Ground::HeightPx(grid, piece.wx, piece.wy);
+                RenderEntry e{};
+                e.depth = piece.wx + piece.wy;
+                e.ent = entt::null;
+                e.tex_ptr = piece.art.PageOf(gf.rect);
+                e.atlas = piece.atlas;
+                e.frame = piece.frame;
+                e.src = piece.art.On(gf.rect);
+                e.dest = {px - static_cast<float>(gf.hotspot_x), py - static_cast<float>(gf.hotspot_y),
+                          static_cast<float>(gf.rect.w), static_cast<float>(gf.rect.h)};
+                e.sel_sx = px;
+                e.sel_sy = py;
+                e.ghost = piece.clear ? kGhostClear : piece.primary ? kGhostBlockedMain : kGhostBlocked;
+                entries.push_back(e);
+            }
+        }
+    }
+
+    // Overlays drawn over a building or a ship from the dat's composite
+    // graphics, each a set of graphics at pixel offsets from the unit's own
+    // anchor. Fire on a damaged building: its damage graphic for how hurt it
+    // is, the stages thresholds of damage taken (25%, 50%, 75%), the heaviest
+    // reached showing. Flags on a building or a transport with anyone inside:
+    // its garrison graphic. Presentation only: what shows is derived from the
+    // simulation each frame, and the art animates on the wall clock.
+    {
+        auto& cfg = Core::ConfigManager::Get();
+        const uint32_t now = SDL_GetTicks();
+        auto overlay = [&](entt::entity b) {
+            const auto* who = registry.try_get<ECS::Components::Owner>(b);
+            const auto* what = registry.try_get<ECS::Components::Identity>(b);
+            if (who == nullptr || what == nullptr || !registry.all_of<ECS::Components::Transform>(b)) return;
+            const auto* building = registry.try_get<ECS::Components::Building>(b);
+            if (building != nullptr && building->state != ECS::Components::BuildingState::Complete) {
+                return;
+            }
+            const auto* garrison = registry.try_get<ECS::Components::Garrison>(b);
+            const bool occupied = garrison != nullptr && !garrison->inside.empty();
+            const auto* hp = registry.try_get<ECS::Components::Health>(b);
+            const bool hurt = building != nullptr && hp != nullptr && hp->max_hp > 0 &&
+                              hp->current_hp < hp->max_hp;
+            if (!occupied && !hurt) return;
+            if (!ECS::Vision::Shows(registry, Core::LocalPlayer(), b)) return;
+            const Core::PlayerId owner = who->player_id;
+            const int unit_id = what->unit_id;
+            const auto* rules = ECS::Players::UnitOf(registry, owner, unit_id);
+            if (rules == nullptr) return;
+            int stage = -1;
+            if (hurt) {
+                const int damage = 100 - hp->current_hp * 100 / hp->max_hp;
+                int reached = -1;
+                for (int i = 0; i < rules->damage_graphic_count; ++i) {
+                    const auto& dg = rules->damage_graphics[i];
+                    if (damage >= dg.percent && dg.percent > reached) {
+                        reached = dg.percent;
+                        stage = dg.graphic;
+                    }
+                }
+            }
+            const int flags = occupied ? rules->garrison_graphic : -1;
+            if (stage < 0 && flags < 0) return;
+
+            // A building's are anchored on the building unit's own piece,
+            // which in a composed building need not be the origin tile.
+            const auto& at = registry.get<ECS::Components::Transform>(b);
+            Core::Fixed32 ax = at.position.x;
+            Core::Fixed32 ay = at.position.y;
+            float wx = 0.0f, wy = 0.0f;
+            if (building != nullptr) {
+                const int art = ECS::Players::ArtOf(registry, owner, unit_id);
+                const auto* pieces = cfg.GetAnnexes(art);
+                if (pieces == nullptr) pieces = cfg.GetAnnexes(unit_id);
+                if (pieces != nullptr) {
+                    for (const auto& piece : *pieces) {
+                        if (piece.unit_id == art || piece.unit_id == unit_id) {
+                            ax = ax + piece.fx;
+                            ay = ay + piece.fy;
+                            break;
+                        }
+                    }
+                }
+                float ox = 0.0f, oy = 0.0f;
+                ArtOffset(registry, b, ox, oy);
+                wx = ax.ToFloat() + ox;
+                wy = ay.ToFloat() + oy;
+            } else {
+                wx = at.previous_position.x.ToFloat() + (ax.ToFloat() - at.previous_position.x.ToFloat()) * alpha;
+                wy = at.previous_position.y.ToFloat() + (ay.ToFloat() - at.previous_position.y.ToFloat()) * alpha;
+            }
+            const float bx = (wx - wy) * (Core::IsometricMath::TILE_WIDTH / 2.0f) - cx;
+            const float by = (wx + wy) * (Core::IsometricMath::TILE_HEIGHT / 2.0f) - cy -
+                             Ground::HeightPx(grid, wx, wy);
+            if (bx < cull_min_x || bx > cull_max_x || by < cull_min_y || by > cull_max_y) return;
+
+            auto add_flame = [&](int graphic, int ox, int oy, int phase) {
+                const auto info = cfg.GetGraphic(graphic);
+                if (!info.Valid()) return;
+                const HAL::GraphicAtlas* atlas =
+                    graphics.GetAtlas(static_cast<uint32_t>(info.slp_id));
+                if (!atlas || atlas->frames.empty()) return;
+                const HAL::ArtPlace art = graphics.Art(static_cast<uint32_t>(info.slp_id), ColourOf(registry, b));
+                if (art.page == nullptr) return;
+                const int frame_ms = std::max(1, cfg.GetFrameMs(graphic, 100));
+                const size_t frame = (now / static_cast<uint32_t>(frame_ms) +
+                                      static_cast<uint32_t>(phase)) % atlas->frames.size();
+                const HAL::GraphicFrame& gf = atlas->frames[frame];
+                if (gf.rect.w <= 0) return;
+                RenderEntry e{};
+                // In front of every piece of the building it is drawn on.
+                e.depth = building != nullptr ? wx + wy + 3.0f : wx + wy;
+                e.sort_bias = 1000;
+                e.ent = b;
+                e.fogged = in_fog(b);
+                e.tex_ptr = art.PageOf(gf.rect);
+                e.src = art.On(gf.rect);
+                e.dest = {bx + static_cast<float>(ox - gf.hotspot_x),
+                          by + static_cast<float>(oy - gf.hotspot_y),
+                          static_cast<float>(gf.rect.w), static_cast<float>(gf.rect.h)};
+                e.sel_sx = bx;
+                e.sel_sy = by;
+                entries.push_back(e);
+            };
+
+            auto add_composite = [&](int graphic) {
+                const auto& deltas = Core::Media::Deltas(graphic);
+                if (deltas.empty()) {
+                    add_flame(graphic, 0, 0, 0);
+                    return;
+                }
+                int phase = 0;
+                for (const auto& delta : deltas) {
+                    // Staggered, so a dozen flames do not flicker in step.
+                    add_flame(delta.graphic, delta.offset_x, delta.offset_y, phase);
+                    phase += 7;
+                }
+            };
+            if (stage >= 0) add_composite(stage);
+            if (flags >= 0) add_composite(flags);
+        };
+        // Only a building or something holding a garrison wears either.
+        for (auto b : registry.view<ECS::Components::Building>()) overlay(b);
+        for (auto b : registry.view<ECS::Components::Garrison>(entt::exclude<ECS::Components::Building>)) {
+            overlay(b);
+        }
+    }
+
+    // Depth sort (back-to-front painter's algorithm), depth compared exactly.
+    // Ties fall to sort bias, then texture -- static map objects on integer
+    // tiles tie exactly and batch by texture -- then entity id, so the order
+    // is stable from frame to frame.
+    std::sort(entries.begin(), entries.end(), [](const RenderEntry& a, const RenderEntry& b) {
+        if (a.depth != b.depth) return a.depth < b.depth;
+        if (a.sort_bias != b.sort_bias) return a.sort_bias < b.sort_bias;
+        if (a.tex_ptr != b.tex_ptr) return a.tex_ptr < b.tex_ptr;
+        return a.ent < b.ent;
+    });
+    
+    // Shadows are a pass of their own, beneath every sprite, so one building
+    // piece's shadow never lands on another piece drawn at the same depth.
+    // Only the dat's shadow graphics cast shadows; a graphic with none casts
+    // none.
+    for (const auto& e : entries) {
+        if (!e.shadow_tex) continue;
+        SDL_Texture* shadow = static_cast<SDL_Texture*>(e.shadow_tex);
+        SDL_SetTextureAlphaMod(shadow, 110);
+        const SDL_Rect* src = e.shadow_src.w > 0 ? &e.shadow_src : nullptr;
+        if (e.shadow_flip) {
+            SDL_RenderCopyExF(sdl_r, shadow, src, &e.shadow_dest, 0.0, nullptr, SDL_FLIP_HORIZONTAL);
+        } else {
+            SDL_RenderCopyF(sdl_r, shadow, src, &e.shadow_dest);
+        }
+    }
+
+    // Then what lies on the ground, before the fog goes over it all.
+    for (const auto& e : entries) {
+        if (!e.ground) continue;
+        if (e.mark >= 0) DrawOutline(sdl_r, marks[static_cast<size_t>(e.mark)], RingPoints());
+        DrawSprite(sdl_r, e);
+    }
+}
+
+int EntityRenderer::OutlinesDrawn() { return g_outlines_drawn; }
+
+bool EntityRenderer::OnGround(int slp_id) { return GroundLevel(slp_id); }
+
+void EntityRenderer::DrawMarks(SDL_Renderer* sdl_r, int sx, int sy, float rx, float ry, bool round,
+                               int hp, int max_hp) {
+    SelectionMark m;
+    m.sx = sx;
+    m.sy = sy;
+    m.rx = rx;
+    m.ry = ry;
+    m.round = round;
+    m.hp = hp;
+    m.max_hp = max_hp;
+    DrawOutline(sdl_r, m, RingPoints());
+    DrawHealthBar(sdl_r, m);
+}
+
+void EntityRenderer::DrawStanding(Renderer& renderer, SDL_Renderer* sdl_r) {
+    auto& graphics = HAL::GraphicCache::Get();
+    auto& entries = Entries();
+    auto& marks = Marks();
+
+    // Outline pass: what standing has outline pixels in its art -- units,
+    // animals, mines, relics; trees and buildings have none -- shows its
+    // silhouette through whatever hides it, however tall it is, and nowhere
+    // else. Anything taller than a tile occludes -- buildings and trees --
+    // and only entries drawn later (greater depth) can cover an entity, so the
+    // search runs forward from each candidate and stops once the depth gap is
+    // wide enough that no sprite could still reach back over it.
+    constexpr float kOccluderHeight = 64.0f;   // taller than one tile
+    constexpr float kDepthWindow = 12.0f;      // tiles ahead worth testing
+    for (size_t i = 0; i < entries.size(); ++i) {
+        RenderEntry& e = entries[i];
+        if (!e.outline_tex) continue;
+        if (!e.tex_ptr || e.ground) {
+            e.outline_tex = nullptr;
+            continue;
+        }
+        bool covered = false;
+        // Points down the middle of the unit: head, chest and feet. It counts
+        // as hidden only where the occluder's own art is opaque at one of them
+        // -- a tree's bounding box reaches far past its leaves.
+        const float mid_x = e.dest.x + e.dest.w * 0.5f;
+        const float probe_y[3] = {e.dest.y + e.dest.h * 0.25f, e.dest.y + e.dest.h * 0.5f,
+                                  e.dest.y + e.dest.h * 0.85f};
+        for (size_t j = i + 1; j < entries.size() && !covered; ++j) {
+            const RenderEntry& o = entries[j];
+            if (o.depth - e.depth > kDepthWindow) break;
+            if (!o.tex_ptr || o.ground || o.dest.h <= kOccluderHeight) continue;
+            const bool boxes = e.dest.x < o.dest.x + o.dest.w && o.dest.x < e.dest.x + e.dest.w
+                            && e.dest.y < o.dest.y + o.dest.h && o.dest.y < e.dest.y + e.dest.h;
+            if (!boxes) continue;
+            if (o.atlas == nullptr || o.atlas->opaque.empty()) {
+                covered = true;
+                continue;
+            }
+            for (float py : probe_y) {
+                int fx = static_cast<int>(mid_x - o.dest.x);
+                const int fy = static_cast<int>(py - o.dest.y);
+                if (o.flip_h) fx = static_cast<int>(o.dest.w) - 1 - fx;
+                if (o.atlas->Covers(o.frame, fx, fy)) { covered = true; break; }
+            }
+        }
+        if (!covered) e.outline_tex = nullptr;
+    }
+
+    for (const auto& e : entries) {
+        if (e.ground) continue;
+        // The outline lies on the ground under its own sprite, so whatever
+        // stands in front of it -- the unit itself included -- covers it.
+        if (e.mark >= 0) DrawOutline(sdl_r, marks[static_cast<size_t>(e.mark)], RingPoints());
+        DrawSprite(sdl_r, e);
+    }
+
+    // The building being placed: the blitter's masks over its pieces, a pass
+    // for each, wiped wherever something stands in front of it.
+    {
+        size_t first = entries.size();
+        bool kinds[4] = {false, false, false, false};
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (entries[i].ghost == 0) continue;
+            first = std::min(first, i);
+            kinds[entries[i].ghost] = true;
+        }
+        for (uint8_t kind = kGhostClear; first < entries.size() && kind <= kGhostBlocked; ++kind) {
+            if (!kinds[kind] || !Stipple::Begin(renderer, sdl_r)) continue;
+            for (size_t i = first; i < entries.size(); ++i) {
+                const RenderEntry& e = entries[i];
+                if (e.ground || !e.tex_ptr) continue;
+                const bool wipe = e.ghost != kind;
+                DrawInto(sdl_r, static_cast<SDL_Texture*>(e.tex_ptr), e, wipe);
+            }
+            SDL_Color colour{0, 0, 0, 255};
+            if (kind != kGhostClear) {
+                const HAL::PaletteColor c = graphics.GetPaletteColor(static_cast<size_t>(
+                    Placement::BlockedColour(g_game_ms, kind == kGhostBlockedMain)));
+                colour = SDL_Color{c.r, c.g, c.b, 255};
+            }
+            Stipple::End(sdl_r, kind == kGhostClear ? Stipple::Pattern::Quarter
+                                                    : Stipple::Pattern::Half,
+                         colour);
+        }
+    }
+
+    // What stands in the fog is dithered whole (FogRenderer.h): its
+    // silhouette in black into the fog's layer, in the same back-to-front
+    // order, wiped again wherever something seen is drawn in front of it.
+    size_t first = entries.size();
+    SDL_FRect box{0, 0, 0, 0};
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const RenderEntry& e = entries[i];
+        if (!e.fogged || e.ground || !e.tex_ptr) continue;
+        if (first == entries.size()) {
+            first = i;
+            box = e.dest;
+        } else {
+            const float x1 = std::max(box.x + box.w, e.dest.x + e.dest.w);
+            const float y1 = std::max(box.y + box.h, e.dest.y + e.dest.h);
+            box.x = std::min(box.x, e.dest.x);
+            box.y = std::min(box.y, e.dest.y);
+            box.w = x1 - box.x;
+            box.h = y1 - box.y;
+        }
+    }
+    if (first < entries.size() && FogRenderer::BeginObjects(renderer, sdl_r)) {
+        for (size_t i = first; i < entries.size(); ++i) {
+            const RenderEntry& e = entries[i];
+            if (e.ground || !e.tex_ptr) continue;
+            const bool wipe = !e.fogged;
+            if (wipe && (e.dest.x >= box.x + box.w || e.dest.x + e.dest.w <= box.x ||
+                         e.dest.y >= box.y + box.h || e.dest.y + e.dest.h <= box.y)) {
+                continue;
+            }
+            DrawInto(sdl_r, static_cast<SDL_Texture*>(e.tex_ptr), e, wipe);
+        }
+        FogRenderer::EndObjects(renderer, sdl_r);
+    }
+
+    // Drawn after everything, tinted with the owner's colour.
+    g_outlines_drawn = 0;
+    for (const auto& e : entries) {
+        if (!e.outline_tex) continue;
+        ++g_outlines_drawn;
+        SDL_Texture* ol = static_cast<SDL_Texture*>(e.outline_tex);
+        const HAL::PaletteColor pc = graphics.GetPlayerColor(e.outline_player);
+        SDL_SetTextureColorMod(ol, pc.r, pc.g, pc.b);
+        if (e.flip_h) {
+            SDL_RenderCopyExF(sdl_r, ol, &e.outline_src, &e.dest, 0.0, nullptr, SDL_FLIP_HORIZONTAL);
+        } else {
+            SDL_RenderCopyF(sdl_r, ol, &e.outline_src, &e.dest);
+        }
+    }
+
+    // Hit point bars and group numbers float over everything in the world.
+    for (const auto& m : marks) {
+        DrawHealthBar(sdl_r, m);
+        DrawGroupNumber(sdl_r, m);
+    }
+}
+
+} // namespace Rendering

@@ -1,0 +1,83 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The game's data is not in the APK: the player makes it from their own CD
+// with android/package.py, copies the folder to the phone, and the app copies
+// it in on first start (CopyActivity). The version of the data this build
+// plays from is prepare_data.py's, which the folder's version.txt must match.
+def repoRoot = file("$rootDir/..")
+def dataVersion = (new File(repoRoot, 'tools/data/prepare_data.py').text =~ /(?m)^STAMP_VERSION = (\d+)/)[0][1]
+
+// Signed with the release key when one is given -- GitHub's build passes it in
+// OPENAOK_KEYSTORE and its passwords; a machine of one's own can name it in
+// ~/.gradle/gradle.properties as openaok.keystore and so on -- and otherwise
+// with the debug key. An APK installs over another only signed with the same.
+def keystore = System.getenv('OPENAOK_KEYSTORE') ?: findProperty('openaok.keystore')
+def secret = { String env, String property -> System.getenv(env) ?: findProperty(property) }
+
+android {
+    namespace 'org.openaok.game'
+    compileSdk 36
+    ndkVersion '28.2.13676358'
+
+    defaultConfig {
+        applicationId 'org.openaok.game'
+        minSdk 29
+        targetSdk 36
+        // Minutes since 1970: a later build always installs over an earlier.
+        versionCode((int) (System.currentTimeMillis() / 60000L))
+        versionName(System.getenv('OPENAOK_VERSION') ?: 'dev')
+        buildConfigField 'int', 'DATA_VERSION', dataVersion
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static'
+                // OPENAOK_CCACHE set: the native code compiles through ccache.
+                if (System.getenv('OPENAOK_CCACHE')) {
+                    arguments '-DCMAKE_C_COMPILER_LAUNCHER=ccache', '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'
+                }
+                abiFilters 'arm64-v8a'
+            }
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    signingConfigs {
+        release {
+            if (keystore) {
+                storeFile file(keystore)
+                storePassword secret('OPENAOK_KEYSTORE_PASSWORD', 'openaok.keystorePassword')
+                keyAlias secret('OPENAOK_KEY_ALIAS', 'openaok.keyAlias')
+                keyPassword secret('OPENAOK_KEY_PASSWORD', 'openaok.keyPassword')
+            }
+        }
+    }
+
+    buildTypes {
+        // The one to install: optimised native code (CMake's Release).
+        release {
+            minifyEnabled false
+            signingConfig(keystore ? signingConfigs.release : signingConfigs.debug)
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'jni/CMakeLists.txt'
+            version '3.31.6'
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}

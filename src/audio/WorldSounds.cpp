@@ -1,0 +1,119 @@
+#include "audio/WorldSounds.h"
+#include "core/FixedMath.h"
+
+#include <vector>
+
+#include "audio/SoundTable.h"
+#include "core/Media.h"
+#include "ecs/Players.h"
+#include "ecs/Vision.h"
+#include "ecs/components/Animation.h"
+#include "ecs/components/Mortal.h"
+#include "ecs/components/Owner.h"
+#include "ecs/components/Sprite.h"
+#include "ecs/components/Transform.h"
+#include "hal/Audio.h"
+
+namespace Audio::WorldSounds {
+
+namespace {
+
+// What an entity was showing when last heard, and in which Update: by entity
+// index, so a frame allocates nothing.
+struct Seen {
+    entt::entity entity = entt::null;
+    int graphic = -1;
+    int frame = 0;
+    uint32_t pass = 0;
+};
+
+std::vector<Seen> g_seen;
+uint32_t g_pass = 1;
+
+int CivOf(const entt::registry& registry, entt::entity entity) {
+    const auto* owner = registry.try_get<ECS::Components::Owner>(entity);
+    if (owner == nullptr) return -1;
+    const ECS::Players::Player* player = ECS::Players::Find(registry, owner->player_id);
+    return player != nullptr ? player->civ : -1;
+}
+
+// Plays a dat sound from a place in the world. The same file already playing
+// is not started again on top of itself: twenty lumberjacks chop as a steady
+// rhythm, not as one deafening crack.
+void Sound(int sound_id, int civ, const Placement& placement) {
+    const int file = SoundTable::Pick(sound_id, civ);
+    if (file < 0 || HAL::Audio::Playing(file)) return;
+    HAL::Audio::Play(file, placement.volume, placement.pan);
+}
+
+// Every frame sound in (from, to], stepping forward round a looping cycle of
+// `frames`.
+void FrameSounds(int graphic, uint8_t heading, int from, int to, int frames, int civ,
+                 const Placement& placement) {
+    const auto& angles = Core::Media::FrameSounds(graphic);
+    if (angles.empty() || frames <= 0) return;
+    const Core::Media::AngleSounds& angle =
+        angles[static_cast<size_t>(Core::FixedMath::Facet(heading, static_cast<int>(angles.size())))];
+    // Frames passed since last seen, at most one whole cycle.
+    int steps = (to - from + frames) % frames;
+    for (int s = 1; s <= steps; ++s) {
+        const int frame = (from + s) % frames;
+        for (const auto& cue : angle.sounds) {
+            if (cue.sound >= 0 && cue.frame == frame) Sound(cue.sound, civ, placement);
+        }
+    }
+}
+
+} // namespace
+
+void Update(const entt::registry& registry, const Listener& listener,
+            Core::PlayerId viewer) {
+    ++g_pass;
+    auto view = registry.view<ECS::Components::Animation, ECS::Components::Sprite,
+                              ECS::Components::Transform>();
+    for (auto entity : view) {
+        const auto& at = view.get<ECS::Components::Transform>(entity).position;
+        const Placement placement = Place(listener, at.x, at.y);
+        if (placement.volume <= 0.0f) continue;
+        if (!ECS::Vision::Shows(registry, viewer, entity)) continue;
+
+        const auto& anim = view.get<ECS::Components::Animation>(entity);
+        const auto& sprite = view.get<ECS::Components::Sprite>(entity);
+        const Seen now{entity, anim.graphic[static_cast<int>(anim.shown)], sprite.current_frame, g_pass};
+        const auto index = static_cast<size_t>(entt::to_entity(entity));
+        if (index >= g_seen.size()) g_seen.resize(index + 1);
+        // As it was heard last Update, if it was.
+        const Seen before = g_seen[index];
+        const bool heard = before.entity == entity && before.pass == g_pass - 1;
+        g_seen[index] = now;
+
+        if (now.graphic < 0) continue;
+        const int civ = CivOf(registry, entity);
+        if (!heard) {
+            // Something that appears already falling -- a building's
+            // collapse -- is heard as it appears.
+            if (registry.all_of<ECS::Components::Dying>(entity)) {
+                const int start = Core::Media::GraphicSound(now.graphic);
+                if (start >= 0) Sound(start, civ, placement);
+            }
+            continue;
+        }
+        if (before.graphic != now.graphic) {
+            // A new graphic: its own sound, and whatever its frames up to the
+            // current one carry.
+            const int start = Core::Media::GraphicSound(now.graphic);
+            if (start >= 0) Sound(start, civ, placement);
+            FrameSounds(now.graphic, sprite.heading, -1, now.frame,
+                        sprite.frames_per_angle, civ, placement);
+        } else if (before.frame != now.frame) {
+            FrameSounds(now.graphic, sprite.heading, before.frame,
+                        now.frame, sprite.frames_per_angle, civ, placement);
+        }
+    }
+}
+
+void Reset() {
+    g_seen.clear();
+}
+
+} // namespace Audio::WorldSounds

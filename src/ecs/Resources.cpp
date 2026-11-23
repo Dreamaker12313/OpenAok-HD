@@ -1,0 +1,79 @@
+#include "ecs/Resources.h"
+
+#include "core/ConfigManager.h"
+#include "core/Rules.h"
+#include "ecs/Buildings.h"
+#include "ecs/Events.h"
+#include "ecs/Fog.h"
+#include "ecs/Mortality.h"
+#include "ecs/components/Building.h"
+#include "ecs/components/Identity.h"
+#include "ecs/components/Mortal.h"
+#include "ecs/components/Owner.h"
+#include "ecs/components/Sprite.h"
+#include "ecs/components/Transform.h"
+
+namespace ECS::Resources {
+
+void Exhaust(entt::registry& registry, Physics::Grid& grid, entt::entity resource) {
+    if (!registry.valid(resource)) return;
+
+    // A farm is a building: its own teardown handles its art, its owner's
+    // books and its ground.
+    if (registry.all_of<Components::Building>(resource)) {
+        const auto* owner = registry.try_get<Components::Owner>(resource);
+        const auto* identity = registry.try_get<Components::Identity>(resource);
+        const auto* at = registry.try_get<Components::Transform>(resource);
+        Events::Emit(registry, {.kind = Events::Kind::Exhausted, .subject = resource,
+                                .player = owner != nullptr ? owner->player_id : Core::PLAYER_GAIA,
+                                .id = identity != nullptr ? identity->unit_id : -1,
+                                .at = at != nullptr ? at->position : Components::Vector2D{}});
+        Buildings::Destroy(registry, grid, resource);
+        return;
+    }
+
+    // Who does not see it go keeps it as it was.
+    Fog::Going(registry, resource);
+    // A carcass gathered out leaves its body.
+    if (const auto* corpse = registry.try_get<Components::Corpse>(resource); corpse != nullptr && corpse->was >= 0) {
+        Mortality::Spent(registry, resource);
+        registry.destroy(resource);
+        return;
+    }
+    if (const auto* at = registry.try_get<Components::Transform>(resource)) {
+        const auto position = at->position;
+        const int x = Physics::TileOf(position.x);
+        const int y = Physics::TileOf(position.y);
+        // A map object blocks the tile it stands on; its remains do not.
+        grid.SetWalkable(x, y, true);
+
+        // What it leaves behind, if the dat names anything.
+        if (const auto* identity = registry.try_get<Components::Identity>(resource)) {
+            const Core::Rules::UnitRules* rules = Core::Rules::Unit(identity->unit_id);
+            auto& cfg = Core::ConfigManager::Get();
+            const auto remains = rules != nullptr ? cfg.GetObjectArt(rules->dead_unit)
+                                                  : Core::ConfigManager::ObjectArt{};
+            if (remains.Valid()) {
+                const entt::entity stump = registry.create();
+                registry.emplace<Components::Transform>(stump, position, position);
+                Components::Sprite sprite{};
+                sprite.slp_id = remains.slp_id;
+                sprite.slp_frame = 0;
+                sprite.width = 0;
+                sprite.height = 0;
+                registry.emplace<Components::Sprite>(stump, std::move(sprite));
+                // It lies for the dat's decay time (a stump three minutes),
+                // then is gone.
+                const Core::Rules::UnitRules* stump_rules = Core::Rules::Unit(rules->dead_unit);
+                const int32_t lies = stump_rules != nullptr ? Mortality::DecayMs(*stump_rules) : 0;
+                if (lies > 0) {
+                    registry.emplace<Components::Corpse>(
+                        stump, Components::Corpse{.remaining_ms = lies, .remains = rules->dead_unit});
+                }
+            }
+        }
+    }
+    registry.destroy(resource);
+}
+
+} // namespace ECS::Resources

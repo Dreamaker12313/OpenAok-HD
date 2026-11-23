@@ -1,0 +1,330 @@
+#include "ecs/Navigation.h"
+
+#include <algorithm>
+
+#include "core/FixedMath.h"
+#include "ecs/BuildingGeometry.h"
+#include "ecs/Combat.h"
+#include "ecs/Players.h"
+#include "ecs/components/Animation.h"
+#include "ecs/components/Building.h"
+#include "ecs/components/Flier.h"
+#include "ecs/components/Identity.h"
+#include "ecs/components/Mortal.h"
+#include "ecs/components/Owner.h"
+#include "pathfinding/ApproachPlanner.h"
+#include "pathfinding/Pathfinder.h"
+
+namespace ECS::Navigation {
+
+Physics::Layer LayerOfUnit(const entt::registry& registry, const Physics::Grid& grid,
+                           Core::PlayerId player, int unit_id) {
+    const Core::Rules::UnitRules* rules = Players::UnitOf(registry, player, unit_id);
+    return rules != nullptr ? grid.LayerOf(rules->terrain_restriction) : Physics::kLand;
+}
+
+Physics::Layer LayerOf(const entt::registry& registry, const Physics::Grid& grid,
+                       entt::entity entity) {
+    const auto* identity = registry.try_get<Components::Identity>(entity);
+    if (identity == nullptr) return Physics::kLand;
+    const auto* owner = registry.try_get<Components::Owner>(entity);
+    const Core::PlayerId player = owner != nullptr ? owner->player_id : Core::PLAYER_GAIA;
+    // Keyed with its owner: a gate opens to its owner and allies, and this
+    // is how every route, step and standing spot learns whose unit asks.
+    return Physics::Keyed(
+        LayerOfUnit(registry, grid, Players::RulesPlayer(registry, entity), identity->unit_id),
+        player);
+}
+
+bool CanStand(const entt::registry& registry, const Physics::Grid& grid,
+              entt::entity entity, Components::Vector2D at) {
+    return grid.Passable(LayerOf(registry, grid, entity), Physics::TileOf(at.x),
+                         Physics::TileOf(at.y));
+}
+
+Core::Fixed32 RadiusOf(const entt::registry& registry, entt::entity entity) {
+    const auto* identity = registry.try_get<Components::Identity>(entity);
+    const Core::Rules::UnitRules* rules =
+        identity != nullptr ? Players::RulesFor(registry, entity, identity->unit_id) : nullptr;
+    return rules != nullptr ? rules->size_x : Core::Fixed32(0);
+}
+
+namespace {
+
+// Puts the survey's keys in order, each a key and its body. The keys are
+// all different, so there is one order whatever the means: here, last
+// tick's order with this tick's keys, put right by insertion as the few
+// that changed tile move along, and those new since sorted and merged in.
+void SortKeys(std::vector<std::pair<uint64_t, uint32_t>>& keys, const std::vector<Body>& bodies) {
+    static std::vector<entt::entity> previous;   // last tick's bodies, in order
+    static std::vector<uint32_t> body_of;        // by entity index: its body, + 1
+    static std::vector<uint32_t> seen;           // by entity index: the pass that set body_of
+    static std::vector<uint8_t> placed;          // by body
+    static std::vector<std::pair<uint64_t, uint32_t>> head, tail;
+    static uint32_t pass = 0;
+    if (++pass == 0) pass = 1;
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const auto index = static_cast<size_t>(entt::to_entity(bodies[i].entity));
+        if (index >= body_of.size()) {
+            body_of.resize(index + 1, 0);
+            seen.resize(index + 1, 0);
+        }
+        body_of[index] = static_cast<uint32_t>(i) + 1;
+        seen[index] = pass;
+    }
+    placed.assign(bodies.size(), 0);
+    head.clear();
+    for (entt::entity e : previous) {
+        const auto index = static_cast<size_t>(entt::to_entity(e));
+        if (index >= seen.size() || seen[index] != pass) continue;
+        const uint32_t body = body_of[index] - 1;
+        if (bodies[body].entity != e) continue;
+        head.push_back(keys[body]);
+        placed[body] = 1;
+    }
+    tail.clear();
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        if (placed[i] == 0) tail.push_back(keys[i]);
+    }
+    // Insertion, given up for a full sort if the order has changed a lot.
+    const size_t budget = head.size() * 8 + 1024;
+    size_t moves = 0;
+    for (size_t i = 1; i < head.size() && moves <= budget; ++i) {
+        const auto key = head[i];
+        size_t j = i;
+        while (j > 0 && key < head[j - 1]) {
+            head[j] = head[j - 1];
+            --j;
+            ++moves;
+        }
+        head[j] = key;
+    }
+    if (moves > budget) std::sort(head.begin(), head.end());
+    std::sort(tail.begin(), tail.end());
+    std::merge(head.begin(), head.end(), tail.begin(), tail.end(), keys.begin());
+    previous.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) previous[i] = bodies[keys[i].second].entity;
+}
+
+// The walks planned this tick, for RouteBeside.
+struct SharedWalk {
+    Components::Vector2D from, to;
+    Physics::Layer layer;
+    Core::Fixed32 radius;
+    Components::Path path;
+};
+struct SharedWalks {
+    std::vector<SharedWalk> walks;
+};
+// Within this many tiles of a shared walk's start, across and along, a unit
+// takes it.
+const Core::Fixed32 kShareReach(2);
+
+} // namespace
+
+void Survey(entt::registry& registry, const Physics::Grid& grid) {
+    registry.ctx().emplace<SharedWalks>().walks.clear();
+    auto& traffic = registry.ctx().emplace<Traffic>();
+    traffic.width = grid.GetWidth();
+    traffic.height = grid.GetHeight();
+    traffic.bodies.clear();
+    // Every unit: what has an animation and is not a building, and still has
+    // a body -- not one dying.
+    const auto& buildings = registry.storage<Components::Building>();
+    const auto& dying = registry.storage<Components::Dying>();
+    const auto& corpses = registry.storage<Components::Corpse>();
+    // A bird in the air is in nobody's way.
+    const auto& fliers = registry.storage<Components::Flier>();
+    const auto& paths = registry.storage<Components::Path>();
+    const auto& identities = registry.storage<Components::Identity>();
+    const auto& makers = registry.storage<Components::RulesOf>();
+    const auto& owners = registry.storage<Components::Owner>();
+    const Players::Table* table = Players::TableOf(registry);
+    auto units = registry.view<const Components::Transform, const Components::Animation>();
+    for (auto e : units) {
+        if (buildings.contains(e) || dying.contains(e) || corpses.contains(e) || fliers.contains(e)) continue;
+        const auto& at = units.get<const Components::Transform>(e).position;
+        if (!grid.InBounds(Physics::TileOf(at.x), Physics::TileOf(at.y))) continue;
+        // RadiusOf, from the storages and the table found above.
+        Core::Fixed32 radius{};
+        if (identities.contains(e)) {
+            const Core::PlayerId player = makers.contains(e)   ? makers.get(e).player
+                                          : owners.contains(e) ? owners.get(e).player_id
+                                                               : Core::PLAYER_GAIA;
+            if (const auto* rules = Players::UnitOf(table, player, identities.get(e).unit_id)) radius = rules->size_x;
+        }
+        const bool moving = paths.contains(e) && paths.get(e).current_waypoint_index < paths.get(e).waypoints.size();
+        traffic.bodies.push_back({e, at.x, at.y, radius, moving});
+    }
+    // By tile, then by entity: sorted on one key each, tile above entity.
+    const int w = traffic.width;
+    static std::vector<std::pair<uint64_t, uint32_t>> keys;   // key, body
+    static std::vector<Body> unsorted;
+    keys.resize(traffic.bodies.size());
+    for (size_t i = 0; i < traffic.bodies.size(); ++i) {
+        const Body& b = traffic.bodies[i];
+        const auto tile = static_cast<uint32_t>(Physics::TileOf(b.y) * w + Physics::TileOf(b.x));
+        keys[i] = {(static_cast<uint64_t>(tile) << 32) | entt::to_integral(b.entity), static_cast<uint32_t>(i)};
+    }
+    SortKeys(keys, traffic.bodies);
+    unsorted.swap(traffic.bodies);
+    traffic.bodies.resize(unsorted.size());
+    for (size_t i = 0; i < keys.size(); ++i) traffic.bodies[i] = unsorted[keys[i].second];
+    // Each tile's first body: the tiles up to a body's own start at it.
+    const size_t tiles = static_cast<size_t>(w) * traffic.height;
+    traffic.first.resize(tiles + 1);
+    size_t from = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t tile = static_cast<size_t>(keys[i].first >> 32);
+        if (tile < from) continue;
+        std::fill(traffic.first.begin() + static_cast<std::ptrdiff_t>(from),
+                  traffic.first.begin() + static_cast<std::ptrdiff_t>(tile) + 1, static_cast<int32_t>(i));
+        from = tile + 1;
+    }
+    std::fill(traffic.first.begin() + static_cast<std::ptrdiff_t>(from), traffic.first.end(),
+              static_cast<int32_t>(keys.size()));
+}
+
+const Traffic* TrafficOf(const entt::registry& registry) {
+    return registry.ctx().find<Traffic>();
+}
+
+namespace {
+
+// How far past the box round the start and the goal the units standing about
+// are taken in, in tiles.
+constexpr int kStandingReach = 3;
+
+const std::vector<entt::entity>* g_marching = nullptr;
+
+bool Marches(entt::entity e) {
+    return g_marching != nullptr && std::binary_search(g_marching->begin(), g_marching->end(), e);
+}
+
+} // namespace
+
+void Marching(const std::vector<entt::entity>* group) { g_marching = group; }
+
+Core::Fixed32 GapAt(const entt::registry& registry, entt::entity entity, Components::Vector2D at,
+                    entt::entity target) {
+    const Core::Fixed32 r = RadiusOf(registry, entity);
+    const Buildings::Bounds box = Combat::BoxOf(registry, target);
+    const Buildings::Bounds reach{box.min_x - r, box.min_y - r, box.max_x + r, box.max_y + r};
+    return reach.DistanceFrom(at);
+}
+
+Components::Path Route(const entt::registry& registry, const Physics::Grid& grid,
+                       entt::entity entity, Components::Vector2D from,
+                       Components::Vector2D to, entt::entity target, Core::Fixed32 range) {
+    static std::vector<Pathfinding::Standing> standing;
+    standing.clear();
+    if (const Traffic* traffic = TrafficOf(registry)) {
+        const int x0 = std::max(0, std::min(Physics::TileOf(from.x), Physics::TileOf(to.x)) - kStandingReach);
+        const int y0 = std::max(0, std::min(Physics::TileOf(from.y), Physics::TileOf(to.y)) - kStandingReach);
+        const int x1 = std::min(traffic->width - 1, std::max(Physics::TileOf(from.x), Physics::TileOf(to.x)) + kStandingReach);
+        const int y1 = std::min(traffic->height - 1, std::max(Physics::TileOf(from.y), Physics::TileOf(to.y)) + kStandingReach);
+        for (int ty = y0; ty <= y1; ++ty) {
+            const size_t row = static_cast<size_t>(ty) * traffic->width;
+            for (int32_t i = traffic->first[row + x0]; i < traffic->first[row + x1 + 1]; ++i) {
+                const Body& b = traffic->bodies[static_cast<size_t>(i)];
+                if (b.entity == entity || b.entity == target || b.moving || Marches(b.entity)) continue;
+                standing.push_back({b.x - b.radius, b.y - b.radius, b.x + b.radius, b.y + b.radius});
+            }
+        }
+    }
+    auto path = Pathfinding::AStar::FindRoute(grid, from, to, LayerOf(registry, grid, entity),
+                                              RadiusOf(registry, entity), &standing);
+    path.target = target;
+    path.range = range;
+    return path;
+}
+
+Components::Path RouteBeside(entt::registry& registry, const Physics::Grid& grid,
+                             entt::entity entity, Components::Vector2D from,
+                             Components::Vector2D to) {
+    const Physics::Layer layer = LayerOf(registry, grid, entity);
+    const Core::Fixed32 radius = RadiusOf(registry, entity);
+    auto& walks = registry.ctx().emplace<SharedWalks>().walks;
+    for (const SharedWalk& s : walks) {
+        if (s.to.x != to.x || s.to.y != to.y || s.layer != layer || s.radius < radius) continue;
+        if (Core::FixedMath::Abs(s.from.x - from.x) > kShareReach ||
+            Core::FixedMath::Abs(s.from.y - from.y) > kShareReach) {
+            continue;
+        }
+        if (!Pathfinding::AStar::BodyClear(grid, from, s.path.waypoints.front(), layer, radius)) continue;
+        Components::Path path;
+        path.waypoints = s.path.waypoints;
+        path.goal = s.path.goal;
+        path.has_goal = s.path.has_goal;
+        return path;
+    }
+    Components::Path path = Route(registry, grid, entity, from, to);
+    if (!path.waypoints.empty()) walks.push_back({from, to, layer, radius, path});
+    return path;
+}
+
+Components::Vector2D Toward(const entt::registry& registry, const Physics::Grid& grid,
+                            entt::entity entity, Components::Vector2D to) {
+    const auto* at = registry.try_get<Components::Transform>(entity);
+    const Physics::Layer layer = LayerOf(registry, grid, entity);
+    const int region = at != nullptr ? RegionOf(registry, grid, entity) : -1;
+    // Somewhere it can stand and get to -- not a pocket of open ground walled
+    // in by trees: there.
+    if (CanStand(registry, grid, entity, to) &&
+        (region < 0 || Pathfinding::RegionAt(grid, Physics::TileOf(to.x), Physics::TileOf(to.y), layer) == region)) {
+        return to;
+    }
+    if (at == nullptr || region < 0) return to;
+    // The nearest tile of the unit's own ground, ring by ring out from the
+    // spot -- the nearest to the unit among those as near.
+    constexpr int kReach = 32;
+    const int cx = Physics::TileOf(to.x);
+    const int cy = Physics::TileOf(to.y);
+    for (int r = 1; r <= kReach; ++r) {
+        int best_x = 0, best_y = 0;
+        Core::Fixed32 best_d{};
+        bool found = false;
+        for (int y = cy - r; y <= cy + r; ++y) {
+            for (int x = cx - r; x <= cx + r; ++x) {
+                if (x != cx - r && x != cx + r && y != cy - r && y != cy + r) continue;
+                if (Pathfinding::RegionAt(grid, x, y, layer) != region) continue;
+                const Core::Fixed32 d = Core::FixedMath::Distance(Core::Fixed32(x) - at->position.x,
+                                                                  Core::Fixed32(y) - at->position.y);
+                if (!found || d < best_d) {
+                    found = true;
+                    best_d = d;
+                    best_x = x;
+                    best_y = y;
+                }
+            }
+        }
+        if (!found) continue;
+        // On that ring round the spot, the approach planner's own point
+        // facing that tile: as near the spot as the ground allows, not a
+        // tile's middle.
+        Pathfinding::ApproachRequest ask;
+        ask.target = Buildings::TileBounds(to);
+        ask.from = {Core::Fixed32(best_x), Core::Fixed32(best_y)};
+        ask.standoff = Core::Fixed32(r) - Core::Fixed32(4) / Core::Fixed32(10);
+        ask.clearance = Core::Fixed32(1) / Core::Fixed32(2);
+        ask.layer = layer;
+        const auto spot = Pathfinding::FindStandingSpot(grid, ask);
+        if (spot.found && Pathfinding::RegionAt(grid, Physics::TileOf(spot.spot.x),
+                                                Physics::TileOf(spot.spot.y), layer) == region) {
+            return spot.spot;
+        }
+        return {Core::Fixed32(best_x), Core::Fixed32(best_y)};
+    }
+    return to;
+}
+
+int RegionOf(const entt::registry& registry, const Physics::Grid& grid,
+             entt::entity entity) {
+    const auto* at = registry.try_get<Components::Transform>(entity);
+    if (at == nullptr) return -1;
+    return Pathfinding::RegionAt(grid, Physics::TileOf(at->position.x),
+                                 Physics::TileOf(at->position.y),
+                                 LayerOf(registry, grid, entity));
+}
+
+} // namespace ECS::Navigation

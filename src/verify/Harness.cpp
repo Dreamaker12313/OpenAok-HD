@@ -1,0 +1,161 @@
+#include "verify/Harness.h"
+
+#include <cstdlib>
+#include <string>
+
+#include "ecs/Digest.h"
+
+namespace Verify {
+
+uint64_t Fingerprint(const entt::registry& registry) {
+    return ECS::Digest::Of(registry);
+}
+
+int Run(int ticks) {
+    // Every scenario runs, even after one fails, so a single pass reports every
+    // broken thing. Each builds its own world, so the order below carries no
+    // meaning.
+    //
+    // AOE_VERIFY_ONLY=water,fishing runs just the scenarios named, by the word
+    // their result line starts with; the gate never sets it.
+    const char* only = std::getenv("AOE_VERIFY_ONLY");
+    const std::string wanted = only != nullptr ? "," + std::string(only) + "," : "";
+    auto runs = [&](const char* name) {
+        return wanted.empty() || wanted.find("," + std::string(name) + ",") != std::string::npos;
+    };
+    bool ok = true;
+    if (runs("entities")) ok &= CheckDeterminism(ticks);
+    if (runs("gathering")) ok &= CheckGathering();
+    if (runs("dropoff")) ok &= CheckDropoff();
+    if (runs("sequence")) ok &= CheckSequence();
+    if (runs("collapse")) ok &= CheckCollapse();
+    if (runs("herding")) ok &= CheckHerding();
+    if (runs("crowd")) ok &= CheckCrowd();
+    if (runs("spread")) ok &= CheckSpread();
+    if (runs("felling")) ok &= CheckFelling();
+    if (runs("notices")) ok &= CheckNotices();
+    if (runs("foundations")) ok &= CheckFoundations();
+    if (runs("fog")) ok &= CheckFog();
+    if (runs("flag")) ok &= CheckFlag();
+    if (runs("spies")) ok &= CheckSpies();
+    if (runs("capture")) ok &= CheckCapture();
+    if (runs("planner")) ok &= CheckApproachPlanner();
+    if (runs("building")) ok &= CheckConstruction();
+    if (runs("production")) ok &= CheckProduction();
+    if (runs("techs")) ok &= CheckTechs();
+    if (runs("combat")) ok &= CheckCombat();
+    if (runs("vision")) ok &= CheckVision();
+    if (runs("garrison")) ok &= CheckGarrison();
+    if (runs("animals")) ok &= CheckAnimals();
+    if (runs("duties")) ok &= CheckDuties();
+    if (runs("monks")) ok &= CheckMonks();
+    if (runs("maps")) ok &= CheckMaps();
+    if (runs("script")) ok &= CheckScript();
+    if (runs("ai")) ok &= CheckAI();
+    if (runs("pace")) ok &= CheckPace();
+    if (runs("seven")) ok &= CheckSeven();
+    if (runs("crossing")) ok &= CheckCrossing();
+    if (runs("net")) ok &= CheckNet();
+    if (runs("victory")) ok &= CheckVictory();
+    if (runs("water")) ok &= CheckWater();
+    if (runs("fishing")) ok &= CheckFishing();
+    if (runs("navy")) ok &= CheckNavy();
+    if (runs("boats")) ok &= CheckBoats();
+    if (runs("attackgroups")) ok &= CheckAttackGroups();
+    if (runs("targets")) ok &= CheckTargets();
+    if (runs("zoom")) ok &= CheckZoom();
+    if (runs("selection")) ok &= CheckSelection();
+    if (runs("march")) ok &= CheckMarch();
+    if (runs("aggression")) ok &= CheckAggression();
+    if (runs("walkers")) ok &= CheckWalkers();
+    if (runs("population")) ok &= CheckPopulation();
+    if (runs("stress")) ok &= CheckStress();
+    if (runs("shipangles")) ok &= CheckShipAngles();
+    if (runs("turning")) ok &= CheckTurning();
+    if (runs("colours")) ok &= CheckColours();
+    if (runs("buttons")) ok &= CheckButtons();
+    if (runs("search")) ok &= CheckSearch();
+    if (runs("hunt")) ok &= CheckHunt();
+    if (runs("answer")) ok &= CheckAnswer();
+    if (runs("pocket")) ok &= CheckPocket();
+    if (runs("clearing")) ok &= CheckClearing();
+    if (runs("passing")) ok &= CheckPassing();
+    if (runs("carryon")) ok &= CheckCarryOn();
+    if (runs("step")) ok &= CheckStep();
+    if (runs("walledtree")) ok &= CheckWalledTree();
+    if (runs("setoff")) ok &= CheckSetOff();
+    if (runs("crowdgoal")) ok &= CheckCrowdGoal();
+    if (runs("sharedwalk")) ok &= CheckSharedWalk();
+    if (runs("replanspread")) ok &= CheckReplanSpread();
+    if (runs("pages")) ok &= CheckPages();
+    if (runs("minimapdead")) ok &= CheckMinimapDead();
+    if (runs("help")) ok &= CheckHelp();
+    if (runs("halve")) ok &= CheckHalve();
+    if (runs("helpbox")) ok &= CheckHelpBox();
+    if (runs("marks")) ok &= CheckMarks();
+    if (runs("smalltextures")) ok &= CheckSmallTextures();
+    if (runs("outline")) ok &= CheckOutline();
+    if (runs("cursor")) ok &= CheckCursor();
+    if (runs("fogedge")) ok &= CheckFogEdge();
+    if (runs("queuesplit")) ok &= CheckQueueSplit();
+    if (runs("queueoverview")) ok &= CheckQueueOverview();
+    if (runs("terraincell")) ok &= CheckTerrainCell();
+    if (runs("options")) ok &= CheckOptions();
+    if (runs("connections")) ok &= CheckConnections();
+    if (runs("backtowork")) ok &= CheckBackToWork();
+    if (runs("garrisonfall")) ok &= CheckGarrisonFall();
+    if (runs("corpsecolour")) ok &= CheckCorpseColour();
+    if (runs("wondercount")) ok &= CheckWonderCount();
+    if (runs("savecheats")) ok &= CheckSaveCheats();
+    if (runs("stanceside")) ok &= CheckStanceSide();
+    if (runs("gateplace")) ok &= CheckGatePlace();
+    if (runs("farmorder")) ok &= CheckFarmOrder();
+    if (runs("idlemilitary")) ok &= CheckIdleMilitary();
+    if (runs("scenarioversion")) ok &= CheckScenarioVersion();
+    if (runs("unfinisheddrop")) ok &= CheckUnfinishedDrop();
+    if (runs("farmfield")) ok &= CheckFarmField();
+    if (runs("deadtrap")) ok &= CheckDeadTrap();
+    if (runs("strayarrow")) ok &= CheckStrayArrow();
+    if (runs("scenariovictory")) ok &= CheckScenarioVictory();
+    if (runs("advancedbuttons")) ok &= CheckAdvancedButtons();
+    if (runs("lobbyvictory")) ok &= CheckLobbyVictory();
+    if (runs("townstruck")) ok &= CheckTownStruck();
+    if (runs("mapscripts")) ok &= CheckMapScripts();
+    if (runs("dropdownrows")) ok &= CheckDropDownRows();
+    if (runs("answerdraft")) ok &= CheckAnswerDraft();
+    if (runs("dropoffbeyond")) ok &= CheckDropoffBeyond();
+    if (runs("objectart")) ok &= CheckObjectArt();
+    if (runs("stumps")) ok &= CheckStumps();
+    if (runs("forests")) ok &= CheckForests();
+    if (runs("buildstump")) ok &= CheckBuildOverStump();
+    if (runs("felledplaced")) ok &= CheckFelledPlaced();
+    if (runs("groundlayer")) ok &= CheckGroundLayer();
+    if (runs("tcground")) ok &= CheckTownCenterGround();
+    if (runs("hawks")) ok &= CheckHawks();
+    if (runs("carcass")) ok &= CheckCarcassPanel();
+    if (runs("carcassart")) ok &= CheckCarcassArt();
+    if (runs("wolves")) ok &= CheckWolves();
+    if (runs("lobby")) ok &= CheckLobby();
+    if (runs("formations")) ok &= CheckFormations();
+    if (runs("landing")) ok &= CheckLanding();
+    if (runs("market")) ok &= CheckMarket();
+    if (runs("trade")) ok &= CheckTrade();
+    if (runs("tribute")) ok &= CheckTribute();
+    if (runs("diplomacy")) ok &= CheckDiplomacy();
+    if (runs("chat")) ok &= CheckChat();
+    if (runs("score")) ok &= CheckScore();
+    if (runs("save")) ok &= CheckSave();
+    if (runs("recording")) ok &= CheckRecording();
+    if (runs("walls")) ok &= CheckWalls();
+    if (runs("repair")) ok &= CheckRepair();
+    if (runs("packing")) ok &= CheckPacking();
+    if (runs("converted")) ok &= CheckConversion();
+    if (runs("modes")) ok &= CheckModes();
+    if (runs("cheats")) ok &= CheckCheats();
+    if (runs("scenario")) ok &= CheckScenario();
+    if (runs("waypoints")) ok &= CheckWaypoints();
+    if (runs("editor")) ok &= CheckEditor();
+    return ok ? 0 : 3;
+}
+
+} // namespace Verify

@@ -1,0 +1,29 @@
+#pragma once
+#include <cstdint>
+
+#include "core/FixedPoint.h"
+
+namespace ECS::Components {
+
+// A unit that has been killed and is playing its death.
+struct Dying {
+    int32_t remaining_ms = 0;
+};
+
+// What a unit leaves on the ground: a body that lies for the dat's corpse
+// decay time, or a carcass whose food rots away at the unit's own rate until
+// it is gone.
+struct Corpse {
+    int32_t remaining_ms = 0;          // a body: until it disappears
+    int32_t lies_ms = 0;               // a body: how long it lies in all, as it rots
+    Core::Fixed32 rot_per_second{};    // a carcass: food lost each second
+    Core::Fixed32 rot{};               // carried fraction of food not yet lost
+    // A carcass: the animal it was, as the original keeps it while it holds
+    // food -- what the panel names and shows (-1: a body).
+    int was = -1;
+    // A body or a stump: the dead unit lying here, whose rules say whether a
+    // building may be laid over it (-1: unknown).
+    int remains = -1;
+};
+
+} // namespace ECS::Components
