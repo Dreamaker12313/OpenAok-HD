@@ -7,6 +7,11 @@ OpenAokHD runs from the player's own Age of Empires II: HD Edition (2013) data o
 
 This repository contains no game data. You need your own copy of Age of Empires II: HD Edition. Not affiliated with, endorsed by or sponsored by Microsoft / Forgotten Empires.
 
+Screenshots
+Main menu	Official campaigns
+Main menu	Official campaigns
+Random map setup	In-game HUD and command deck
+Random map setup	In-game
 Features
 Game content
 31 civilizations (including the HD DLC civilizations; Gaia is counted separately)
@@ -29,7 +34,7 @@ DE-style split bottom bar: building/command panel + unit panel on the left, a se
 The minimap borrows each civilisation's own bottom-panel material and has an independent wooden frame
 Centred age label, re-aligned resource bar and top-right buttons
 Pause menu keeps the game visible behind it (no full-screen black panel)
-In-game options: VSync, 30/60/120 FPS cap, and Small/Medium/Large HUD scaling without changing the game view
+In-game options: VSync, 30/60/120 FPS cap and Small/Medium/Large HUD scaling without changing the game view
 Control groups 1–5 as touch buttons: tap to select, long-press to assign the current selection
 Android / touch
 arm64 Android 10+ (API 29)
