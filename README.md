@@ -16,11 +16,11 @@ It supports 31 civilizations, the original, The Conquerors and the HD expansions
 
 | Main menu | Official campaigns |
 |---|---|
-| ![Main menu](docs/screenshots/main-menu.jpg) | ![Official campaigns](docs/screenshots/official-campaigns.jpg) |
+| ![Main menu](main-menu.jpg) | ![Official campaigns](official-campaigns.jpg) |
 
 | Random map setup | In-game HUD and command deck |
 |---|---|
-| ![Random map setup](docs/screenshots/random-map-setup.jpg) | ![In-game](docs/screenshots/in-game.jpg) |
+| ![Random map setup](random-map-setup.jpg) | ![In-game](in-game.jpg) |
 
 ---
 
@@ -177,4 +177,4 @@ HD conversion tools:
 - SLP/DRS format references [openage](https://github.com/SFTtech/openage)
 - *Age of Empires II* is copyright Microsoft / Forgotten Empires
 
-See `LICENSE` for the code license and `THIRD_PARTY_NOTICES.md` for third-party components.
+See `LICENSE` for the code license and `THIRD_PARTY_NO
