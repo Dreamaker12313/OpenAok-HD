@@ -1,3 +1,23 @@
+# OpenAokHD v1.5
+
+![DLC 文明特色兵种](docs/images/dlc-units.jpg)
+
+![HD 开场过场](docs/images/hd-intro.png)
+
+> 当前版本：**v1.5**（对比 v1.2 `xmusic3` 基线）。完整修复与新增列表见
+> [CHANGELOG-v1.5.md](CHANGELOG-v1.5.md)。
+
+## v1.5 亮点
+
+- 31 个文明与 DLC 特色兵种全部可生产、升级，官方图标与头像修复。
+- HD `intro.slp` 32 位 SLP 解码，开场过场与中文旁白。
+- 中文战役、教程、场景、嘲讽语音完整接入，可切中/英。
+- HUD 命令区、小地图按钮、框选、驻扎、弹道、攻击动画集中修复。
+- 历史页 31 文明官方文本与插图；中文 UTF-8 修复。
+- 标题思源宋体、正文 Sarasa Fixed SC、剧情霞鹜文楷。
+
+---
+
 **[简体中文](README.zh-CN.md)** | [English](README.md)
 
 # OpenAokHD
@@ -9,18 +29,6 @@ OpenAokHD 读取玩家自己的 **Age of Empires II: HD Edition（2013）** 数�
 
 > 本项目不包含任何游戏数据。你需要自己拥有正版《帝国时代 II：HD 版》。
 > 与 Microsoft / Forgotten Empires 无关联。
-
----
-
-## 截图
-
-| 主菜单 | 官方战役 |
-|---|---|
-| ![主菜单](docs/screenshots/main-menu.jpg) | ![官方战役](docs/screenshots/official-campaigns.jpg) |
-
-| 随机地图设置 | 局内 HUD 与触控面板 |
-|---|---|
-| ![随机地图设置](docs/screenshots/random-map-setup.jpg) | ![局内](docs/screenshots/in-game.jpg) |
 
 ---
 
@@ -52,20 +60,14 @@ OpenAokHD 读取玩家自己的 **Age of Empires II: HD Edition（2013）** 数�
 - 小地图借用各文明自己的底栏材质，并有独立木框
 - 时代文字居中，资源栏与顶栏右侧按钮重新对齐
 - 暂停菜单保留游戏画面，不再盖整块黑底
-- 局内设置：垂直同步、30/60/120 FPS、HUD 小/中/大三档，不改变游戏画面
-- 编队 1–5 触控按钮：短按选择，长按把当前选择编入
 
 ### Android / 触控
 
-- arm64 Android 10+（API 29）
+- arm64 Android 29+
 - 双屏：上屏地图，下屏触控命令面板
 - 单屏设备自动使用原版布局
 - 数据导入：选择 `OpenAoK-data` 文件夹，校验 manifest 后复制到应用内部
 - 应用名 **OpenAokHD**，国王头像圆角图标
-- 左键模式用于选择和框选；右键模式用于移动、采集、建造、修理和攻击
-- 右键点树/矿优先采集；点迷雾区域直接移动
-- 双击单位选中屏幕内同类，再次双击取消
-- 局内作弊：资源、显示地图、快速建造、快速生产、VDML 等
 
 ---
 
