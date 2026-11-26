@@ -1,3 +1,23 @@
+# OpenAokHD v1.5
+
+![DLC 文明特色兵种](docs/images/dlc-units.jpg)
+
+![HD 开场过场](docs/images/hd-intro.png)
+
+> 当前版本：**v1.5**（对比 v1.2 `xmusic3` 基线）。完整修复与新增列表见
+> [CHANGELOG-v1.5.md](CHANGELOG-v1.5.md)。
+
+## v1.5 亮点
+
+- 31 个文明与 DLC 特色兵种全部可生产、升级，官方图标与头像修复。
+- HD `intro.slp` 32 位 SLP 解码，开场过场与中文旁白。
+- 中文战役、教程、场景、嘲讽语音完整接入，可切中/英。
+- HUD 命令区、小地图按钮、框选、驻扎、弹道、攻击动画集中修复。
+- 历史页 31 文明官方文本与插图；中文 UTF-8 修复。
+- 标题思源宋体、正文 Sarasa Fixed SC、剧情霞鹜文楷。
+
+---
+
 **[简体中文](README.zh-CN.md)** | [English](README.md)
 
 # OpenAokHD
@@ -9,18 +29,6 @@ It supports 31 civilizations, the original, The Conquerors and the HD expansions
 
 > This repository contains **no game data**. You need your own copy of *Age of Empires II: HD Edition*.
 > Not affiliated with, endorsed by or sponsored by Microsoft / Forgotten Empires.
-
----
-
-## Screenshots
-
-| Main menu | Official campaigns |
-|---|---|
-| ![Main menu](main-menu.jpg) | ![Official campaigns](official-campaigns.jpg) |
-
-| Random map setup | In-game HUD and command deck |
-|---|---|
-| ![Random map setup](random-map-setup.jpg) | ![In-game](in-game.jpg) |
 
 ---
 
@@ -52,20 +60,14 @@ It supports 31 civilizations, the original, The Conquerors and the HD expansions
 - The minimap borrows each civilisation's own bottom-panel material and has an independent wooden frame
 - Centred age label, re-aligned resource bar and top-right buttons
 - Pause menu keeps the game visible behind it (no full-screen black panel)
-- In-game options: VSync, 30/60/120 FPS cap and Small/Medium/Large HUD scaling without changing the game view
-- Control groups 1–5 as touch buttons: tap to select, long-press to assign the current selection
 
 ### Android / touch
 
-- arm64 Android 10+ (API 29)
+- arm64 Android 29+
 - Dual screen: map on the top screen, touch command deck on the bottom screen
 - Single-screen devices fall back to the original layout
 - Data import: pick the `OpenAoK-data` folder; the app verifies the manifest and copies it into private storage
 - App name **OpenAokHD**, king-portrait rounded icon
-- Left-button mode for selection and box-select; right-button mode for move, gather, build, repair and attack
-- Right-click on a tree or mine prioritises gathering; clicking fog issues a move into it
-- Double-tap a unit to select all units of the same type on screen; double-tap again to clear
-- In-game cheats: resources, map reveal, fast construction, fast production, VDML and more
 
 ---
 
@@ -177,4 +179,4 @@ HD conversion tools:
 - SLP/DRS format references [openage](https://github.com/SFTtech/openage)
 - *Age of Empires II* is copyright Microsoft / Forgotten Empires
 
-See `LICENSE` for the code license and `THIRD_PARTY_NO
+See `LICENSE` for the code license and `THIRD_PARTY_NOTICES.md` for third-party components.
